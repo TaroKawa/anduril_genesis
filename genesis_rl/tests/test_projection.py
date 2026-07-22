@@ -18,7 +18,7 @@ def test_gate_dead_ahead_level():
     pos = torch.zeros(1, 3)
     quat = quat_from_euler_frd_ned(torch.zeros(1), torch.zeros(1), torch.zeros(1))
     gate = torch.tensor([[10.0, 0.0, 0.0]])
-    out = det.detect(pos, quat, gate, torch.zeros(1), noise=False)
+    out = det.detect(pos, quat, gate, torch.tensor([[1.0, 0.0, 0.0]]), noise=False)
     assert out[0, 2].item() == 1.0  # visible
     assert abs(out[0, 0].item()) < 1e-5  # 水平中央
     # v = CY + FX*tan(20°) → v_n = FX*tan(20°)/CY > 0(画像で下)
@@ -32,7 +32,7 @@ def test_gate_centered_when_pitched_forward():
     pos = torch.zeros(1, 3)
     quat = quat_from_euler_frd_ned(torch.zeros(1), torch.tensor([math.radians(-CAM_TILT_DEG)]), torch.zeros(1))
     gate = torch.tensor([[10.0, 0.0, 0.0]])
-    out = det.detect(pos, quat, gate, torch.zeros(1), noise=False)
+    out = det.detect(pos, quat, gate, torch.tensor([[1.0, 0.0, 0.0]]), noise=False)
     assert out[0, 2].item() == 1.0
     assert abs(out[0, 0].item()) < 1e-4
     assert abs(out[0, 1].item()) < 1e-4
@@ -44,7 +44,7 @@ def test_gate_right_offset():
     pos = torch.zeros(1, 3)
     quat = quat_from_euler_frd_ned(torch.zeros(1), torch.zeros(1), torch.zeros(1))
     gate = torch.tensor([[10.0, 3.0, 0.0]])  # NEDでe正=右
-    out = det.detect(pos, quat, gate, torch.zeros(1), noise=False)
+    out = det.detect(pos, quat, gate, torch.tensor([[1.0, 0.0, 0.0]]), noise=False)
     assert out[0, 0].item() > 0.05
 
 
@@ -53,7 +53,7 @@ def test_behind_not_visible():
     pos = torch.zeros(1, 3)
     quat = quat_from_euler_frd_ned(torch.zeros(1), torch.zeros(1), torch.zeros(1))
     gate = torch.tensor([[-10.0, 0.0, 0.0]])
-    out = det.detect(pos, quat, gate, torch.zeros(1), noise=False)
+    out = det.detect(pos, quat, gate, torch.tensor([[1.0, 0.0, 0.0]]), noise=False)
     assert out[0, 2].item() == 0.0
     assert out[0, 3].item() == 1.0  # 未検出はrel_dist=1
 
@@ -63,7 +63,7 @@ def test_rel_dist_monotonic():
     quat = quat_from_euler_frd_ned(torch.zeros(1), torch.tensor([math.radians(-20.0)]), torch.zeros(1))
     rels = []
     for d in [3.0, 6.0, 12.0, 24.0]:
-        out = det.detect(torch.zeros(1, 3), quat, torch.tensor([[d, 0.0, 0.0]]), torch.zeros(1), noise=False)
+        out = det.detect(torch.zeros(1, 3), quat, torch.tensor([[d, 0.0, 0.0]]), torch.tensor([[1.0, 0.0, 0.0]]), noise=False)
         rels.append(out[0, 3].item())
     assert rels == sorted(rels)  # 遠いほどrel_dist大
 
@@ -77,7 +77,7 @@ def test_noise_grows_when_close():
     def spread(d):
         us = []
         for _ in range(300):
-            out = det.detect(torch.zeros(1, 3), quat, torch.tensor([[d, 0.0, 0.0]]), torch.zeros(1), noise=True)
+            out = det.detect(torch.zeros(1, 3), quat, torch.tensor([[d, 0.0, 0.0]]), torch.tensor([[1.0, 0.0, 0.0]]), noise=True)
             us.append(out[0, 0].item())
         return torch.tensor(us).std().item()
 

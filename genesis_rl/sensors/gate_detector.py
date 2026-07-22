@@ -46,7 +46,7 @@ class SimGateDetector:
         drone_pos_ned: torch.Tensor,   # (N,3)
         drone_quat_ned: torch.Tensor,  # (N,4) body FRD → NED
         gate_pos_ned: torch.Tensor,    # (N,3) アクティブゲート中心
-        gate_yaw: torch.Tensor,        # (N,) ゲート法線方位
+        gate_normal: torch.Tensor,     # (N,3) ゲート法線(傾き込み・NED)
         noise: bool = True,
     ) -> torch.Tensor:
         """(N,4) [u_n, v_n, visible, rel_dist]。"""
@@ -64,7 +64,6 @@ class SimGateDetector:
         in_front = rel_cam[:, 2] > 0.3
         in_frame = (u > 10) & (u < IMG_W - 10) & (v > 10) & (v < IMG_H - 10)
         in_range = d < 45.0
-        gate_normal = torch.stack([torch.cos(gate_yaw), torch.sin(gate_yaw), torch.zeros_like(gate_yaw)], dim=1)
         view_dir = rel_ned / d.unsqueeze(1).clamp(min=1e-6)
         cos_ang = (view_dir * gate_normal).sum(dim=1).abs()
         angle_ok = cos_ang > math.cos(math.radians(75.0))

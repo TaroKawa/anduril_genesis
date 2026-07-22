@@ -65,12 +65,13 @@ class GenesisRaceEnv:
         self.n_gates = self.course.n_gates
         gate_centers = np.stack([g.center_ned for g in self.course.gates])
         gate_yaws = np.array([g.yaw for g in self.course.gates])
+        # ゲートは傾き(pitch/roll)を持つ → 面の3軸(法線・側方・面内上方)を回転行列から取る
+        rots = np.stack([g.rotation_ned() for g in self.course.gates])  # (G,3,3)
         self.gate_pos = torch.tensor(gate_centers, device=self.device, dtype=torch.float32)   # (G,3) NED
         self.gate_yaw = torch.tensor(gate_yaws, device=self.device, dtype=torch.float32)      # (G,)
-        self.gate_normal = torch.stack(
-            [torch.cos(self.gate_yaw), torch.sin(self.gate_yaw), torch.zeros_like(self.gate_yaw)], dim=1)
-        self.gate_side = torch.stack(
-            [-torch.sin(self.gate_yaw), torch.cos(self.gate_yaw), torch.zeros_like(self.gate_yaw)], dim=1)
+        self.gate_normal = torch.tensor(rots[:, :, 0], device=self.device, dtype=torch.float32)
+        self.gate_side = torch.tensor(rots[:, :, 1], device=self.device, dtype=torch.float32)
+        self.gate_up = torch.tensor(-rots[:, :, 2], device=self.device, dtype=torch.float32)
 
         # --- シーン ---
         rng = np.random.default_rng(seed + 777)
@@ -171,7 +172,9 @@ class GenesisRaceEnv:
     def _attach_extra_cameras(self):
         from ..sensors.camera_rig import chase_offset_T, fpv_offset_T
         self.extra_cams["fpv_hd"].attach(self.drone_entity.base_link, fpv_offset_T())
-        self.extra_cams["chase"].attach(self.drone_entity.base_link, chase_offset_T(back=3.5, up=1.5))
+        # チェイスは近め(機体280mmが画面で見えるように)
+        self.extra_cams["chase"].attach(self.drone_entity.base_link,
+                                        chase_offset_T(back=2.0, up=0.9, pitch_down_deg=12.0))
 
     # --- リセット ---
 
@@ -227,6 +230,7 @@ class GenesisRaceEnv:
         self.act_delay[envs_idx] = s.act_delay_steps + torch.randint(0, s.act_delay_jitter + 1, (n,), device=dev)
 
         self.active_gate[envs_idx] = active
+        self._update_ribbon(envs_idx)
         self.episode_steps[envs_idx] = 0
         self.steps_since_gate[envs_idx] = 0
         self.last_action[envs_idx] = 0.0
@@ -264,12 +268,16 @@ class GenesisRaceEnv:
             self.steps_since_gate += 1
 
         self.prev_cmd = cmd_new
+        # ゲート通過したenvはリボンの表示窓を進める(通過区間を消し、5ゲート先まで出す)
+        if self.gate_pass_flag.any():
+            self._update_ribbon(self.gate_pass_flag.nonzero(as_tuple=False).squeeze(1))
         # --- フレーム境界(30Hz): レンダ + 検出 ---
         rgb = self.rig.render()
         self.img_queue.push(rgb)
-        gp = self.gate_pos[self.active_gate.clamp(max=self.n_gates - 1)]
-        gy = self.gate_yaw[self.active_gate.clamp(max=self.n_gates - 1)]
-        det = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gy, noise=True)
+        act_idx = self.active_gate.clamp(max=self.n_gates - 1)
+        gp = self.gate_pos[act_idx]
+        gn = self.gate_normal[act_idx]
+        det = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=True)
         self.det_queue.push(det)
 
         obs, priv, closeness = self._build_obs(state, actions)
@@ -327,15 +335,16 @@ class GenesisRaceEnv:
         gp = self.gate_pos[act]
         gn = self.gate_normal[act]
         gside = self.gate_side[act]
+        gup = self.gate_up[act]
         rel = state["pos_ned"] - gp
         x_rel = (rel * gn).sum(dim=1)
         crossed = (self.prev_x_rel < 0) & (x_rel >= 0) & (self.active_gate < self.n_gates)
         passed = torch.zeros_like(crossed)
         if crossed.any():
-            # 交点の面内オフセット(側方・上下)。1物理ステップの移動は小さいので
-            # 現在位置の面内成分で近似(120Hzチェックなので誤差は最大数cm)。
+            # 交点の面内オフセット(側方・面内上方、ゲート傾き込み)。1物理ステップの
+            # 移動は小さいので現在位置の面内成分で近似(120Hzチェック、誤差は数cm)。
             y_off = (rel * gside).sum(dim=1)
-            z_off = -rel[:, 2]  # NED d: 上方向オフセット = -(p_d - g_d)
+            z_off = (rel * gup).sum(dim=1)
             inside = (y_off.abs() < 0.75) & (z_off.abs() < 0.75)
             passed = crossed & inside
             if passed.any():  # noqa: SIM102
@@ -357,6 +366,28 @@ class GenesisRaceEnv:
         self.wrong_way_flag |= back & ~crossed
         # 通過したenvはprev_x_relが新ゲート基準に更新済み。それ以外は現在値へ。
         self.prev_x_rel = torch.where(passed, self.prev_x_rel, x_rel)
+
+    RIBBON_AHEAD = 5  # 青パスはアクティブゲートから5ゲート先まで表示
+
+    def _update_ribbon(self, envs_idx: torch.Tensor):
+        """リボン区間の表示窓を更新。通過済み区間は床下(-80m)へ沈めて非表示にする。
+
+        区間エンティティは非固定+gravity_compensation=1.0なのでper-envにset_posできる。
+        """
+        ents = getattr(self.builder, "ribbon_entities", [])
+        if not ents or len(envs_idx) == 0:
+            return
+        if not hasattr(self, "_ribbon_home"):
+            # build直後の基準位置をキャプチャ(メッシュ再センタリングに依存しないため)
+            self._ribbon_home = [ent.get_pos()[0].clone() for ent in ents]
+        active = self.active_gate[envs_idx]
+        sink = torch.tensor([0.0, 0.0, -80.0], device=self.device)
+        for k, ent in enumerate(ents):
+            gate_i = k + 1  # この区間が導くゲート番号
+            vis = (active <= gate_i) & (gate_i < active + self.RIBBON_AHEAD)
+            home = self._ribbon_home[k].expand(len(envs_idx), 3)
+            ent.set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
+                        envs_idx=envs_idx, zero_velocity=True, relative=False)
 
     def _check_collision(self):
         contacts = self.drone_entity.get_contacts()
@@ -430,8 +461,8 @@ class GenesisRaceEnv:
 
         # 真値closeness(報酬用・ノイズなし)
         gp = self.gate_pos[act]
-        gy = self.gate_yaw[act]
-        det_true = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gy, noise=False)
+        gn = self.gate_normal[act]
+        det_true = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=False)
         closeness = (1.0 - det_true[:, 3]) * det_true[:, 2]
 
         return obs, priv, closeness

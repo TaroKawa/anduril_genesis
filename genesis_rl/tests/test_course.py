@@ -30,6 +30,35 @@ def test_course_invariants(seed, stage):
         assert (dp > 2.5).all()
 
 
+def test_longitudinal_progression():
+    """コースは始点(ホール手前)→終点(奥)へ縦方向に伸びる(Nがほぼ単調増加)。"""
+    for seed in range(6):
+        spec = CourseGenerator(seed=seed, stage=2).generate()
+        n = np.stack([g.center_ned for g in spec.gates])[:, 0]
+        assert (np.diff(n) > -1.5).all()          # 後戻りしない
+        assert n[-1] - n[0] > 50.0                # 奥までしっかり進む
+
+
+def test_gate_tilts_bounded():
+    """ゲートは形を変えず少しだけ傾く(±12°以内)。スタートゲートは水平。"""
+    spec = CourseGenerator(seed=1, stage=2).generate()
+    assert spec.gates[0].pitch == 0.0 and spec.gates[0].roll == 0.0
+    tilts = np.array([[g.pitch, g.roll] for g in spec.gates[1:]])
+    assert (np.abs(tilts) <= np.radians(12) + 1e-9).all()
+    assert np.abs(tilts).max() > 1e-4  # 実際に傾いている
+
+
+def test_sharp_turns_exist():
+    """最大90°級のターン(真横へ行くゲート)が生成される。"""
+    max_turn = 0.0
+    for seed in range(10):
+        spec = CourseGenerator(seed=seed, stage=2).generate()
+        yaws = np.array([g.yaw for g in spec.gates])
+        d = np.abs((np.diff(yaws) + np.pi) % (2 * np.pi) - np.pi)
+        max_turn = max(max_turn, float(d.max()))
+    assert max_turn > np.radians(55)
+
+
 def test_stage2_has_altitude_variation():
     diffs = []
     for seed in range(8):

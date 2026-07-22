@@ -18,11 +18,41 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .course import BAR_W, CourseSpec, GATE_DEPTH, GATE_INNER, GATE_OUTER, ribbon_mesh
+from .course import BAR_W, CourseSpec, GATE_DEPTH, GATE_INNER, GATE_OUTER, ribbon_segments
 
 
 def ned2w(p) -> tuple:
     return (float(p[0]), float(-p[1]), float(-p[2]))
+
+
+_T_FLIP = np.diag([1.0, -1.0, -1.0])
+
+
+def rot_ned_to_world(R_ned: np.ndarray) -> np.ndarray:
+    """NED系の回転行列 → Genesis world系(x軸180°の相似変換)。"""
+    return _T_FLIP @ R_ned @ _T_FLIP
+
+
+def np_R_to_quat(R: np.ndarray) -> tuple:
+    """回転行列 → クォータニオン wxyz。"""
+    tr = np.trace(R)
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = np.sqrt(max(R[i, i] - R[j, j] - R[k, k] + 1.0, 1e-12)) * 2
+        q = [0.0, 0.0, 0.0, 0.0]
+        q[0] = (R[k, j] - R[j, k]) / s
+        q[i + 1] = 0.25 * s
+        q[j + 1] = (R[j, i] + R[i, j]) / s
+        q[k + 1] = (R[k, i] + R[i, k]) / s
+        w, x, y, z = q
+    return (float(w), float(x), float(y), float(z))
 
 
 @dataclass
@@ -154,18 +184,16 @@ class SceneBuilder:
     def _add_gates(self, scene, gs):
         c = self.colors
         for gi, gate in enumerate(self.course.gates):
-            cx, cy, cz = ned2w(gate.center_ned)
-            yaw_w = -gate.yaw  # NED yaw(N→E正) → world yaw(x→y正)は符号反転
-            deg = float(np.degrees(yaw_w))
-            cos, sin = np.cos(yaw_w), np.sin(yaw_w)
+            cw = np.array(ned2w(gate.center_ned))
+            R_w = rot_ned_to_world(gate.rotation_ned())  # 列: x=法線, y=±側方, z=面内上方
+            quat = np_R_to_quat(R_w)
 
-            def place(off_side, off_up, size_side, size_up):
-                """ゲート面内(side=横, up=縦)のオフセット → world配置。奥行きはゲート法線方向。"""
-                px = cx - sin * off_side
-                py = cy + cos * off_side
-                pz = cz + off_up
-                return gs.morphs.Box(pos=(px, py, pz), euler=(0, 0, deg),
-                                     size=(GATE_DEPTH, size_side, size_up), fixed=True)
+            def place(off_side, off_up, size_side, size_up, collision=True):
+                """ゲート面内(side=横, up=縦)のオフセット → world配置(傾き込み)。"""
+                pos = cw + R_w @ np.array([0.0, off_side, off_up])
+                return gs.morphs.Box(pos=tuple(pos), quat=quat,
+                                     size=(GATE_DEPTH, size_side, size_up),
+                                     fixed=True, collision=collision)
 
             half = (GATE_INNER + BAR_W) / 2  # バー中心オフセット 1.05m
             emis = c.gate_rgb
@@ -182,34 +210,45 @@ class SceneBuilder:
                 up = float(self.rng.choice([-half, half])) if abs(side) < GATE_INNER / 2 \
                     else float(self.rng.uniform(-1.2, 1.2))
                 w = float(self.rng.uniform(0.15, 0.5))
-                m = gs.morphs.Box(
-                    pos=(cx - sin * side, cy + cos * side, cz + up),
-                    euler=(0, 0, deg), size=(GATE_DEPTH + 0.02, w, 0.18),
-                    fixed=True, collision=False)
+                pos = cw + R_w @ np.array([0.0, side, up])
+                m = gs.morphs.Box(pos=tuple(pos), quat=quat,
+                                  size=(GATE_DEPTH + 0.02, w, 0.18),
+                                  fixed=True, collision=False)
                 self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
 
             # ゲート真下の床の金色グロー(実画像1,2)
             self._static(
                 scene, gs,
-                gs.morphs.Box(pos=(cx, cy, 0.02), size=(2.2, 2.2, 0.02), fixed=True, collision=False),
+                gs.morphs.Box(pos=(cw[0], cw[1], 0.02), size=(2.2, 2.2, 0.02),
+                              fixed=True, collision=False),
                 None, emissive=c.glow_rgb,
             )
 
     def _add_ribbon(self, scene, gs):
+        """ゲートごとのリボン区間を個別エンティティで追加(動的表示用)。
+
+        非固定+gravity_compensation=1.0 でその場に留まり、per-envで
+        set_pos により表示(原点)/非表示(床下-80m)を切り替えられる。
+        self.ribbon_entities[i] = ゲートi+1へ向かう区間。
+        """
         import trimesh
 
-        verts_ned, faces = ribbon_mesh(self.course.ribbon_pts, width=1.8)
-        verts_w = verts_ned.copy()
-        verts_w[:, 1] *= -1.0
-        verts_w[:, 2] *= -1.0
-        mesh = trimesh.Trimesh(vertices=verts_w, faces=np.concatenate([faces, faces[:, ::-1]]), process=False)
-        f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
-        mesh.export(f.name)
-        self._static(
-            scene, gs,
-            gs.morphs.Mesh(file=f.name, fixed=True, collision=False, decimate=False, convexify=False),
-            None, emissive=self.colors.ribbon_rgb,
-        )
+        self.ribbon_entities = []
+        for verts_ned, faces in ribbon_segments(self.course, width=1.8):
+            verts_w = verts_ned.copy()
+            verts_w[:, 1] *= -1.0
+            verts_w[:, 2] *= -1.0
+            mesh = trimesh.Trimesh(vertices=verts_w,
+                                   faces=np.concatenate([faces, faces[:, ::-1]]), process=False)
+            f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+            mesh.export(f.name)
+            ent = scene.add_entity(
+                gs.morphs.Mesh(file=f.name, fixed=False, collision=False,
+                               decimate=False, convexify=False),
+                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                surface=gs.surfaces.Emission(color=tuple(self.colors.ribbon_rgb)),
+            )
+            self.ribbon_entities.append(ent)
 
     def _add_clutter(self, scene, gs):
         """駐機機体シルエット(箱の組合せ、暗灰色)。リボンから離れた床に配置。"""
@@ -239,9 +278,11 @@ class SceneBuilder:
         # 並進はmassフリー、回転はDRで吸収)。
         vol = 0.28 * 0.28 * 0.16
         rho = drone_cfg.mass / vol
+        # 寸法は仕様§3.6の280x280x160mm(ゲート開口1.5mに対する比もspec通り)。
+        # 暗色だと映像で見失うため明るい色にする(FPVは箱の内側=背面カリングで映らない)
         self.drone_entity = scene.add_entity(
             gs.morphs.Box(pos=(0.0, 0.0, 1.8), size=(0.28, 0.28, 0.16), fixed=False),
             material=gs.materials.Rigid(rho=rho),
-            surface=gs.surfaces.Rough(color=(0.25, 0.25, 0.28)),
+            surface=gs.surfaces.Rough(color=(0.95, 0.95, 1.0)),
         )
         return self.drone_entity

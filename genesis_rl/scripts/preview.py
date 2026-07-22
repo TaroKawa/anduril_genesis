@@ -59,9 +59,10 @@ def main():
     cfg.render = RenderConfig(backend="sequential", width=320, height=180)
     # プレビューは公称ダイナミクス・ノイズ控えめで見やすく
     cfg.drone.dr_mass = cfg.drone.dr_k_rate = cfg.drone.dr_drag = cfg.drone.dr_hover = cfg.drone.dr_inertia = (1.0, 1.0)
-    cfg.sensors.noise_scale = 0.5
+    cfg.sensors.noise_scale = 0.3
     cfg.sensors.act_delay_jitter = 0
     cfg.no_gate_timeout_s = 12.0  # プレビューはゆっくり飛ぶのでタイムアウトを緩める
+    cfg.max_episode_s = 300.0     # 完走(~70s)がエピソード上限60sで切られないように
 
     env = GenesisRaceEnv(cfg, num_envs=1, extra_cameras=True)
     pilot = ScriptedPilot(env.course, env.device, v_des=args.v_des)
@@ -90,12 +91,21 @@ def main():
         obs, priv, reward, done, info = env.step(action)
         max_gates_seen = max(max_gates_seen, int(info["gates_passed"][0].item()))
 
-        # 俯瞰カメラはドローンを横上から追うTVカメラ(固定視点では120mホールが映らない)
+        # 俯瞰カメラはドローンを横上から追うTVカメラ(固定視点では120mホールが映らない)。
+        # オフセットはホール中心方向へ取り、壁の外に出ないようクランプする。
         st_w = env.drone_entity.get_pos()
         p = st_w[0] if st_w.ndim == 2 else st_w
-        env.extra_cams["overview"].set_pose(
-            pos=(float(p[0]) - 8.0, float(p[1]) - 10.0, float(p[2]) + 6.0),
-            lookat=(float(p[0]), float(p[1]), float(p[2])))
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+        hall = env.course.hall
+        import math as _m
+        dcx, dcy = -px, -py  # ホール中心への方向
+        n = _m.hypot(dcx, dcy) or 1.0
+        cx_ = px + dcx / n * 14.0 - 7.0
+        cy_ = py + dcy / n * 14.0
+        cx_ = max(min(cx_, hall.length / 2 - 2.0), -hall.length / 2 + 2.0)
+        cy_ = max(min(cy_, hall.width / 2 - 2.0), -hall.width / 2 + 2.0)
+        env.extra_cams["overview"].set_pose(pos=(cx_, cy_, min(pz + 7.5, hall.height - 1.0)),
+                                            lookat=(px, py, pz))
 
         fpv, _, _, _ = env.extra_cams["fpv_hd"].render(rgb=True)
         chase, _, _, _ = env.extra_cams["chase"].render(rgb=True)

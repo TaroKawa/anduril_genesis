@@ -32,6 +32,18 @@ class HallSpec:
 class GateSpec:
     center_ned: np.ndarray  # (3,)
     yaw: float              # ゲート法線の方位(コース進行方向) [rad]
+    pitch: float = 0.0      # ゲート面の傾き [rad](形は変えず少しだけ傾ける)
+    roll: float = 0.0
+
+    def rotation_ned(self) -> np.ndarray:
+        """ゲートローカル→NEDの回転行列。列 = (法線, 面内側方, 面内下方)。"""
+        cy, sy = np.cos(self.yaw), np.sin(self.yaw)
+        cp, sp = np.cos(self.pitch), np.sin(self.pitch)
+        cr, sr = np.cos(self.roll), np.sin(self.roll)
+        Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+        Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+        return Rz @ Ry @ Rx
 
 
 @dataclass
@@ -109,46 +121,72 @@ class CourseGenerator:
         # stage0はほぼ直線なので格納庫に収まるようゲート数を絞る(要求はゲート1通過のみ)
         if self.stage <= 0:
             return dict(dpsi_max=np.radians(8), z_range=(1.8, 2.2), climbs=0,
-                        n_gates=min(self.n_gates, 8), seg=(8.0, 12.0))
+                        n_gates=min(self.n_gates, 8), seg=(8.0, 12.0),
+                        tilt=0.0, sharp_p=0.0)
         if self.stage == 1:
-            return dict(dpsi_max=np.radians(25), z_range=(1.5, 3.5), climbs=0,
-                        n_gates=self.n_gates, seg=(8.0, 15.0))
-        return dict(dpsi_max=np.radians(50), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
-                    n_gates=self.n_gates, seg=(8.0, 18.0))
+            return dict(dpsi_max=np.radians(40), z_range=(1.5, 3.5), climbs=0,
+                        n_gates=self.n_gates, seg=(7.0, 13.0),
+                        tilt=np.radians(5), sharp_p=0.1)
+        return dict(dpsi_max=np.radians(90), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
+                    n_gates=self.n_gates, seg=(6.0, 13.0),
+                    tilt=np.radians(12), sharp_p=0.25)
 
     def _try_generate(self, rng) -> CourseSpec | None:
+        """始点(ホール手前)→終点(奥)へ縦方向に進行するコース。
+
+        方位ψは+N基準で±95°にクランプ(後戻りしない=縦方向に伸びる)。
+        横方向は自由: ターンは最大90°、確率的に70-90°の急ターン(真横へ行くゲート)を入れる。
+        奥行きの残り予算が乏しくなったら前進方向へ絞る。
+        """
         hall = self.hall
         p = self._params(rng)
+        psi_lim = np.radians(95.0)
+        far_limit = hall.length / 2 - hall.margin - 3.0
 
         # スタートゲート: ホール手前側、+N向き
-        start = np.array([-hall.length / 2 + hall.margin + 3.0, 0.0, -1.8])
+        start = np.array([-hall.length / 2 + hall.margin + 3.0, rng.uniform(-4.0, 4.0), -1.8])
         centers = [start]
         headings = [0.0]
         psi = 0.0
-        dpsi_prev = 0.0
 
         n_gates = p["n_gates"]
-        # 急上昇/急降下を入れるゲートindex(実画像3の垂直クライム区間の再現)
         climb_idx = set(rng.choice(np.arange(3, n_gates - 1), size=p["climbs"], replace=False).tolist()) \
             if p["climbs"] > 0 else set()
 
         for i in range(1, n_gates + 1):
             ok = False
-            for retry in range(50):
-                L = rng.uniform(*p["seg"])
-                dpsi = 0.6 * dpsi_prev + 0.4 * rng.uniform(-p["dpsi_max"], p["dpsi_max"])
-                psi_new = _wrap(psi + dpsi)
+            for retry in range(60):
                 prev = centers[-1]
-                # 壁回避ステアリング: 壁に近い/リトライが続くときは中心方向へ寄せる
-                near_wall = (
-                    abs(prev[0]) > hall.length / 2 - hall.margin - 12.0
-                    or abs(prev[1]) > hall.width / 2 - hall.margin - 12.0
-                )
-                if near_wall or retry >= 10:
-                    psi_center = np.arctan2(-prev[1], -prev[0])
-                    blend = 0.5 if self.stage >= 1 else 0.25
-                    psi_new = _wrap(psi + _wrap(psi_center - psi) * blend)
+                # 奥行き予算の均等割り: 残りゲートで残りN距離をほぼ使い切る
+                remaining_n = max(far_limit - prev[0], 1.0)
+                target_dn = remaining_n / (n_gates - i + 1)
+
+                # ターン角: 通常は予算から導出±ノイズ、確率的に~90°の急ターン(真横)
+                base = np.arccos(np.clip(target_dn / p["seg"][1], 0.05, 0.98))
+                if rng.random() < p["sharp_p"]:
+                    mag = rng.uniform(0.8, 1.0) * p["dpsi_max"]
+                else:
+                    mag = np.clip(base + rng.uniform(-0.5, 0.5), 0.0, p["dpsi_max"])
+                # 横方向の符号: 慣性 or ランダム、壁際では中央へ
+                if abs(prev[1]) > hall.width / 2 - hall.margin - 6.0:
+                    sign = -np.sign(prev[1])
+                elif abs(psi) > 0.1 and rng.random() < 0.5:
+                    sign = np.sign(psi)
+                else:
+                    sign = rng.choice([-1.0, 1.0])
+                psi_target = float(np.clip(sign * mag, -psi_lim, psi_lim))
+                # ゲートでのターン角(進入→退出)を±dpsi_maxに制限。これを超えると
+                # ヘアピン(ゲート法線が進入/退出の両方から70°超)になり通過不能になる
+                dpsi = float(np.clip(_wrap(psi_target - psi), -p["dpsi_max"], p["dpsi_max"]))
+                psi_new = float(np.clip(psi + dpsi, -psi_lim, psi_lim))
+
+                # セグメント長: 前進成分がtarget_dn近くになるように選ぶ
+                cos_p = max(np.cos(psi_new), 0.05)
+                L = float(np.clip(target_dn / cos_p * rng.uniform(0.8, 1.3), *p["seg"]))
+
                 cand = prev + np.array([L * np.cos(psi_new), L * np.sin(psi_new), 0.0])
+                if cand[0] < prev[0] - 1.0:  # 縦方向にほぼ単調(後戻り禁止)
+                    continue
                 if i in climb_idx:
                     # 急上昇/急降下: 天井近く(~7m)まで、または低空へ
                     z = -rng.uniform(5.5, 7.0) if prev[2] > -4.0 else -rng.uniform(1.5, 2.5)
@@ -172,20 +210,23 @@ class CourseGenerator:
             if not ok:
                 return None
             centers.append(cand)
-            headings.append(psi_new)
-            psi, dpsi_prev = psi_new, dpsi
+            headings.append(float(psi_new))
+            psi = float(psi_new)
 
         centers = np.stack(centers)
 
-        # ゲートyaw = 入る向きと出る向きの円平均
+        # ゲートyaw = 入る向きと出る向きの円平均 + 面の小傾き(形は不変)
         gates = []
         for i in range(len(centers)):
             h_in = headings[i]
             h_out = headings[i + 1] if i + 1 < len(headings) else headings[i]
             yaw = np.arctan2(np.sin(h_in) + np.sin(h_out), np.cos(h_in) + np.cos(h_out))
-            gates.append(GateSpec(center_ned=centers[i], yaw=float(yaw)))
+            tilt = 0.0 if i == 0 else p["tilt"]  # スタートゲートは水平
+            gates.append(GateSpec(center_ned=centers[i], yaw=float(yaw),
+                                  pitch=float(rng.uniform(-tilt, tilt)),
+                                  roll=float(rng.uniform(-tilt, tilt))))
 
-        ribbon = _catmull_rom(centers, samples_per_seg=40)
+        ribbon = _catmull_rom(centers, samples_per_seg=RIBBON_SAMPLES_PER_SEG)
         if not all(self._in_hall(q, slack=2.0) for q in ribbon[::10]):
             return None
 
@@ -227,6 +268,24 @@ class CourseGenerator:
             i = int(np.argmin(np.linalg.norm(spec.ribbon_pts - g.center_ned, axis=1)))
             gate_arc.append(cum[i])
         spec.gate_cum_arc = np.array(gate_arc)
+
+
+RIBBON_SAMPLES_PER_SEG = 40
+
+
+def ribbon_segments(spec: CourseSpec, width: float = 1.8) -> list[tuple[np.ndarray, np.ndarray]]:
+    """ゲートiへ向かうリボン区間(ゲートi-1→i)のメッシュを個別に返す(i=1..n_gates-1)。
+
+    動的表示(アクティブゲートから5ゲート先まで表示・通過区間は消す)のために
+    区間ごとに別エンティティにする。区間の端点は隣接区間と1点共有して繋がって見える。
+    """
+    per = RIBBON_SAMPLES_PER_SEG
+    segs = []
+    for i in range(1, spec.n_gates):
+        lo = per * (i - 1)
+        hi = min(per * i + 1, len(spec.ribbon_pts))
+        segs.append(ribbon_mesh(spec.ribbon_pts[lo:hi], width))
+    return segs
 
 
 def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
