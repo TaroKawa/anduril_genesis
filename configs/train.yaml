@@ -1,0 +1,37 @@
+# Phase 1: Genesis 2GPU学習の既定設定。genesis_rl/config.py のdataclassに対応。
+env:
+  num_envs: 64          # バッチレンダラ不可なら自動で縮小される
+  n_gates: 18
+  course_seed: 0
+  stage: 0              # カリキュラムが自動進級(curriculum.enabled: true)
+  render:
+    backend: auto       # batch(Madrona) -> 不可なら sequential へ自動フォールバック
+    width: 320
+    height: 180
+
+sac:
+  batch_size: 1024
+  replay_capacity: 1000000
+  n_step: 3
+  success_ratio: 0.5
+  burn_in_steps: 50000
+  learn_start: 20000
+  replay_ratio_cap: 8.0
+  compile: true
+
+curriculum:
+  enabled: true
+  window: 200
+  thresholds: [0.7, 0.7, 0.6, 0.5]
+  rebuild_episodes: 300
+  seed_pool: 32
+
+run:
+  mode: async           # 2GPU。デバッグは sync
+  ckpt_dir: checkpoints
+  eval_interval: 250000
+  eval_video: true
+
+hw:
+  collector_gpu: "3070" # デバイス名の部分一致
+  learner_gpu: "4060"
