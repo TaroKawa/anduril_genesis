@@ -1,12 +1,16 @@
 """カリキュラム管理: trailing成功率でステージ進級、env実行時パラメータを更新。
 
-| Stage | コース          | 要求        | ノイズ | 途中スポーン下限 | 色DR | クラッタ | 速度ボーナス |
-|-------|-----------------|-------------|--------|------------------|------|----------|--------------|
-| 0     | 直線(8ゲート)   | ゲート1     | x0.3   | 0                | -    | -        | -            |
-| 1     | 緩カーブ        | 4ゲート     | x0.6   | 0.3              | -    | -        | -            |
-| 2     | フル生成        | 全18        | x1.0   | 0                | o    | -        | -            |
-| 3     | 32シードプール  | 全18        | x1.0   | 0.3              | o    | o        | -            |
-| 4     | 同上            | 全18        | x1.0   | 0                | o    | o        | +20          |
+| Stage | コース            | 要求        | ノイズ | 途中スポーン下限 | 色DR | クラッタ | 速度ボーナス |
+|-------|-------------------|-------------|--------|------------------|------|----------|--------------|
+| 0     | 直線(8ゲート)     | ゲート1     | x0.3   | 0                | -    | -        | -            |
+| 1     | 近接緩カーブ(5-8m)| 2ゲート     | x0.4   | 0                | -    | -        | -            |
+| 2     | 緩カーブ(標準間隔)| 4ゲート     | x0.6   | 0.3              | -    | -        | -            |
+| 3     | フル生成          | 全18        | x1.0   | 0                | o    | -        | -            |
+| 4     | 32シードプール    | 全18        | x1.0   | 0.3              | o    | o        | -            |
+| 5     | 同上              | 全18        | x1.0   | 0                | o    | o        | +20          |
+
+Stage 1(近接緩カーブ)は直線→標準カーブの間の中間難度: ゲート間隔を5-8mに
+詰め、通過直後に次ゲートが視界に入る=報酬までの距離が短い状態でカーブ操作を学ぶ。
 
 途中スポーン確率は逆カリキュラム: 各ステージ開始時はresume_hi(既定0.8)で
 コース全域のゲート手前からスポーンし、成功率が進級閾値に近づくほど上表の
@@ -37,10 +41,11 @@ class StageSpec:
 
 STAGES = [
     StageSpec(0, 1, 0.3, 0.0, False, False, 0.0),
-    StageSpec(1, 4, 0.6, 0.3, False, False, 0.0),
-    StageSpec(2, 18, 1.0, 0.0, True, False, 0.0),
-    StageSpec(2, 18, 1.0, 0.3, True, True, 0.0),
-    StageSpec(2, 18, 1.0, 0.0, True, True, 20.0),
+    StageSpec(1, 2, 0.4, 0.0, False, False, 0.0),   # 近接緩カーブ(中間難度)
+    StageSpec(2, 4, 0.6, 0.3, False, False, 0.0),
+    StageSpec(3, 18, 1.0, 0.0, True, False, 0.0),
+    StageSpec(3, 18, 1.0, 0.3, True, True, 0.0),
+    StageSpec(3, 18, 1.0, 0.0, True, True, 20.0),
 ]
 
 
@@ -97,9 +102,9 @@ class CurriculumManager:
         return self.episodes_since_rebuild >= self.cfg.rebuild_episodes
 
     def next_course_seed(self, base_seed: int) -> int:
-        """再構築ごとに新しいコースシード。Stage3+はプールから循環。"""
+        """再構築ごとに新しいコースシード。Stage4+はプールから循環。"""
         self.episodes_since_rebuild = 0
         self.seed_counter += 1
-        if self.stage >= 3:
+        if self.stage >= 4:
             return base_seed + (self.seed_counter % self.cfg.seed_pool)
         return base_seed + self.seed_counter

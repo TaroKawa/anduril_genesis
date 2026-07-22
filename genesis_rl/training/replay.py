@@ -1,7 +1,8 @@
 """GPU常駐リングReplayバッファ + 成功バッファ(RLPD混合)。
 
-画像はなく凍結ResNetの512次元特徴(fp16)を保存する — 1Mで約2.5GB。
+画像はなく凍結エンコーダ特徴の「履歴窓」(K,384) fp16 を保存する — 250kで約3GB。
 n-step済みの遷移 (feat, vec, priv, act, R_n, gpow=γ^k, done, nfeat, nvec, npriv) を格納。
+feat/vecは (K,·) の履歴窓、priv/actは現在ステップのみ。
 done=真の終端(衝突/完走)のみ。タイムアウトはgpowでブートストラップ継続。
 """
 
@@ -14,14 +15,16 @@ FIELDS = ("feat", "vec", "priv", "act", "rew", "gpow", "done", "nfeat", "nvec", 
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int, vec_dim: int, priv_dim: int, act_dim: int,
-                 feat_dim: int, device: torch.device):
+    def __init__(self, capacity: int, vec_shape: tuple | int, priv_dim: int, act_dim: int,
+                 feat_shape: tuple | int, device: torch.device):
+        vec_shape = (vec_shape,) if isinstance(vec_shape, int) else tuple(vec_shape)
+        feat_shape = (feat_shape,) if isinstance(feat_shape, int) else tuple(feat_shape)
         self.capacity = capacity
         self.device = device
-        self.feat = torch.zeros(capacity, feat_dim, dtype=torch.float16, device=device)
-        self.nfeat = torch.zeros(capacity, feat_dim, dtype=torch.float16, device=device)
-        self.vec = torch.zeros(capacity, vec_dim, device=device)
-        self.nvec = torch.zeros(capacity, vec_dim, device=device)
+        self.feat = torch.zeros(capacity, *feat_shape, dtype=torch.float16, device=device)
+        self.nfeat = torch.zeros(capacity, *feat_shape, dtype=torch.float16, device=device)
+        self.vec = torch.zeros(capacity, *vec_shape, device=device)
+        self.nvec = torch.zeros(capacity, *vec_shape, device=device)
         self.priv = torch.zeros(capacity, priv_dim, device=device)
         self.npriv = torch.zeros(capacity, priv_dim, device=device)
         self.act = torch.zeros(capacity, act_dim, device=device)

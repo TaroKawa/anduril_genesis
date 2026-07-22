@@ -14,14 +14,17 @@ import torch
 
 class NStepAssembler:
     def __init__(self, num_envs: int, n_step: int, gamma: float,
-                 vec_dim: int, priv_dim: int, act_dim: int, feat_dim: int, device: torch.device):
+                 vec_shape: tuple | int, priv_dim: int, act_dim: int,
+                 feat_shape: tuple | int, device: torch.device):
+        vec_shape = (vec_shape,) if isinstance(vec_shape, int) else tuple(vec_shape)
+        feat_shape = (feat_shape,) if isinstance(feat_shape, int) else tuple(feat_shape)
         self.N = num_envs
         self.n = n_step
         self.gamma = gamma
         self.device = device
         n = n_step
-        self.feat = torch.zeros(n, num_envs, feat_dim, device=device)
-        self.vec = torch.zeros(n, num_envs, vec_dim, device=device)
+        self.feat = torch.zeros(n, num_envs, *feat_shape, device=device)
+        self.vec = torch.zeros(n, num_envs, *vec_shape, device=device)
         self.priv = torch.zeros(n, num_envs, priv_dim, device=device)
         self.act = torch.zeros(n, num_envs, act_dim, device=device)
         self.rew_acc = torch.zeros(n, num_envs, device=device)

@@ -16,6 +16,7 @@ services:
     <<: *gpu-all
     shm_size: "8gb" # torch.multiprocessing の共有テンソルキュー用
     ipc: host
+    cap_add: [SYS_PTRACE] # py-spyでのプロファイル用
     environment:
       - PYTHONUNBUFFERED=1
       - PYOPENGL_PLATFORM=egl
@@ -50,6 +51,12 @@ services:
     command:
       ["uv", "run", "python", "-m", "genesis_rl.scripts.preview",
        "--out", "checkpoints/course_preview.mp4"]
+
+  # 本番シム(DCL)推論はDockerを使わずホストで実行する(genesis_rl/scripts/fly_dcl.py):
+  #   UV_PROJECT_ENVIRONMENT=.venv-host uv run python -m genesis_rl.scripts.fly_dcl --ckpt ...
+  # シムはWindowsの127.0.0.1へUDP送信するため、fly_dclがWindows側リレー
+  # (genesis_rl/dcl/win_relay.py)をinterop経由で自動起動してWSLへ転送する。
+  # ※Docker Desktopの公開ポートUDP転送は高レート映像でフローが恒久的に落ちるため使わない(実測)。
 
   tensorboard:
     image: anduril-genesis-rl

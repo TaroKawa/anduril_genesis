@@ -20,8 +20,22 @@ from ..config import TrainConfig
 from ..curriculum import CurriculumManager, STAGES
 from ..envs.genesis_race_env import GenesisRaceEnv
 from ..models.actor import SACActor
-from ..models.encoder import FrozenResNet18
+from ..models.encoder import FrozenDINOv2
 from .nstep import NStepAssembler
+from .profiling import StepProfiler
+
+
+def _hist_windows(seq: torch.Tensor, k: int) -> torch.Tensor:
+    """(T,D...) の時系列 → (T,k,D...) の履歴窓。エピソード先頭はゼロパディング。
+
+    ランタイムのローリング履歴(境界でゼロ埋め)と同じ窓を、成功エピソード
+    キャッシュの列から復元するために使う。
+    """
+    T = seq.shape[0]
+    out = seq.new_zeros(T, k, *seq.shape[1:])
+    for j in range(k):
+        out[j:, k - 1 - j] = seq[: T - j] if j else seq
+    return out
 
 
 class Collector:
@@ -44,17 +58,21 @@ class Collector:
                                    required_gates=min(spec.required_gates, self.env.n_gates - 1),
                                    speed_finish_w=spec.speed_finish_w)
         self.N = self.env.num_envs
-        self.encoder = FrozenResNet18(bf16=cfg.sac.encoder_bf16).to(self.env.device).eval()
-        self._blank_feat = None  # ゼロ画像のResNet特徴(定数)のキャッシュ
+        self.encoder = FrozenDINOv2(bf16=cfg.sac.encoder_bf16).to(self.env.device).eval()
+        self._blank_feat = None  # ゼロ画像のエンコーダ特徴(定数)のキャッシュ
         self.actor = SACActor(hidden=cfg.sac.hidden).to(self.env.device).eval()
         self.nstep = NStepAssembler(self.N, cfg.sac.n_step, cfg.sac.gamma,
-                                    C.VEC_DIM, C.PRIV_DIM, C.ACTION_DIM,
-                                    FrozenResNet18.FEAT_DIM, self.env.device)
+                                    (C.HIST_K, C.VEC_DIM), C.PRIV_DIM, C.ACTION_DIM,
+                                    (C.HIST_K, C.FEAT_DIM), self.env.device)
         self.transitions = 0
         self._obs = None
         self._priv = None
         self._feat = None
         self.rebuild_requested = False
+        self.prof = StepProfiler(cfg.run.profile, self.env.device)
+        if self.prof.enabled:
+            self.env.rig.render = self.prof.wrap("render", self.env.rig.render)
+            self.env.scene.step = self.prof.wrap("physics", self.env.scene.step)
 
     # --- 内部 ---
 
@@ -79,24 +97,33 @@ class Collector:
     def warmup(self):
         self._obs, self._priv = self.env.reset()
         self._feat = self._encode(self._obs["rgb"])
+        dev = self.env.device
+        self._feat_hist = torch.zeros(self.N, C.HIST_K, C.FEAT_DIM, device=dev)
+        self._vec_hist = torch.zeros(self.N, C.HIST_K, C.VEC_DIM, device=dev)
+        self._feat_hist[:, -1] = self._feat
+        self._vec_hist[:, -1] = self._obs["vec"]
 
     def policy_action(self, deterministic: bool = False) -> torch.Tensor:
         if self.transitions < self.cfg.sac.burn_in_steps and not deterministic:
             # ホバーバイアス付きランダム(a3=0 → thrust 0.3325 = 緩上昇)
             return (torch.randn(self.N, C.ACTION_DIM, device=self.env.device) * 0.3).clamp(-1, 1)
         with torch.no_grad():
-            return self.actor.act(self._feat, self._obs["vec"], deterministic=deterministic)
+            return self.actor.act(self._feat_hist, self._vec_hist, deterministic=deterministic)
 
     def step(self, deterministic: bool = False):
         """1ベクトルステップ。returns (matured_batch|None, success_batch|None, ep_infos)"""
-        a = self.policy_action(deterministic)
-        obs2, priv2, rew, done, info = self.env.step(a)
-        feat2 = self._encode(obs2["rgb"])
+        with self.prof.section("actor"):
+            a = self.policy_action(deterministic)
+        with self.prof.section("env_step"):
+            obs2, priv2, rew, done, info = self.env.step(a)
+        with self.prof.section("encode"):
+            feat2 = self._encode(obs2["rgb"])
 
         nfeat, nvec, npriv = feat2, obs2["vec"], priv2
         if done.any():
             idx = info["done_idx"]
-            f_final = self._encode(info["final_obs"]["rgb"])
+            with self.prof.section("encode"):
+                f_final = self._encode(info["final_obs"]["rgb"])
             nfeat = feat2.clone()
             nvec = obs2["vec"].clone()
             npriv = priv2.clone()
@@ -105,16 +132,30 @@ class Collector:
             npriv[idx] = info["final_priv"]
 
         terminal = done & ~info["time_outs"]
-        matured = self.nstep.push(self._feat, self._obs["vec"], self._priv, a,
-                                  rew, done, terminal, nfeat, nvec, npriv)
+        # 遷移用のnext履歴窓。doneのenvはリセット前の履歴+終端観測(final swap済みのnfeat/nvec)
+        with self.prof.section("nstep"):
+            nfeat_hist = torch.cat([self._feat_hist[:, 1:], nfeat.unsqueeze(1)], dim=1)
+            nvec_hist = torch.cat([self._vec_hist[:, 1:], nvec.unsqueeze(1)], dim=1)
+            matured = self.nstep.push(self._feat_hist, self._vec_hist, self._priv, a,
+                                      rew, done, terminal, nfeat_hist, nvec_hist, npriv)
 
-        # 成功エピソード抽出用に直近の全遷移をバッチ列でキャッシュ
-        self._cache_step(a, rew, done, terminal, nfeat, nvec, npriv)
+        # 成功エピソード抽出用に直近の全遷移をバッチ列でキャッシュ(単ステップで保持し、
+        # 抽出時に_hist_windowsで窓を復元してメモリを節約する)
+        with self.prof.section("cache"):
+            self._cache_step(a, rew, done, terminal, nfeat, nvec, npriv)
+            success_batch, ep_infos = self._flush_episodes(done, info)
 
-        success_batch, ep_infos = self._flush_episodes(done, info)
+        # ストリーム履歴を前進(次ステップの「現在」観測。doneのenvはリセット後観測)
+        self._feat_hist = torch.cat([self._feat_hist[:, 1:], feat2.unsqueeze(1)], dim=1)
+        self._vec_hist = torch.cat([self._vec_hist[:, 1:], obs2["vec"].unsqueeze(1)], dim=1)
+        if done.any():
+            idx = info["done_idx"]
+            self._feat_hist[idx, :-1] = 0.0  # エピソード境界: 過去をゼロ埋め(=パディング)
+            self._vec_hist[idx, :-1] = 0.0
 
         self._obs, self._priv, self._feat = obs2, priv2, feat2
         self.transitions += self.N
+        self.prof.tick(self.N)
         return matured, success_batch, ep_infos
 
     # --- 成功エピソードキャッシュ(バッチ列として保持、doneでenv別に切り出し) ---
@@ -156,14 +197,14 @@ class Collector:
         self.env.set_stage_runtime(resume_prob=self.curriculum.resume_prob_now())
 
         # 成功エピソード(ゲート数はenv.required_gates基準のsuccessフラグで判定済み)の
-        # 遷移をキャッシュから抽出(1-step、gpow=γ)
+        # 遷移をキャッシュから抽出(1-step、gpow=γ)。feat/vecは_hist_windowsで
+        # ランタイムと同一の履歴窓(エピソード先頭ゼロパディング)を復元する。
         out = None
         succ_envs = [i for i, s, g in zip(idx, succ, gates)
                      if s or int(g) >= self.cfg.sac.success_min_gates]
         if succ_envs and hasattr(self, "_cache"):
             gamma = self.cfg.sac.gamma
-            keys = ("feat", "vec", "priv", "act", "rew", "nfeat", "nvec", "npriv")
-            cols = {k: [] for k in (*keys, "gpow", "done")}
+            episodes = []
             for env_i in succ_envs:
                 # このenvの現エピソード開始位置: 直近のdone(自分)より前の区間を遡る
                 rows = []
@@ -173,14 +214,20 @@ class Collector:
                         break  # 前のエピソードに到達
                     rows.append(t)
                 rows.reverse()
-                for t in rows:
-                    st = self._cache[t]
-                    for k in keys:
-                        cols[k].append(st[k][env_i])
-                    cols["gpow"].append(gamma * (1.0 - st["terminal"][env_i]))
-                    cols["done"].append(st["terminal"][env_i])
-            if cols["feat"]:
-                out = {k: torch.stack(v, dim=0) for k, v in cols.items()}
+                seq = lambda k: torch.stack([self._cache[t][k][env_i] for t in rows])
+                fh = _hist_windows(seq("feat"), C.HIST_K)
+                vh = _hist_windows(seq("vec"), C.HIST_K)
+                terminal = seq("terminal")
+                episodes.append({
+                    "feat": fh, "vec": vh,
+                    "nfeat": torch.cat([fh[:, 1:], seq("nfeat").unsqueeze(1)], dim=1),
+                    "nvec": torch.cat([vh[:, 1:], seq("nvec").unsqueeze(1)], dim=1),
+                    "priv": seq("priv"), "npriv": seq("npriv"),
+                    "act": seq("act"), "rew": seq("rew"),
+                    "gpow": gamma * (1.0 - terminal), "done": terminal,
+                })
+            if episodes:
+                out = {k: torch.cat([ep[k] for ep in episodes], dim=0) for k in episodes[0]}
         # done envのキャッシュ行は次エピソードと混ざるが、開始位置検出(done flag)で区切れる
         return out, ep_infos
 

@@ -51,6 +51,13 @@ VEC_GATE = slice(6, 11)         # [u_n, v_n, visible, rel_dist, age_n]
 VEC_ONEHOT = slice(11, 11 + MAX_GATES)
 VEC_LAST_ACTION = slice(51, 55)
 VEC_DIM = 55
+# 時系列トークンに入れる動的成分(one-hotは窓内で不変なのでヘッド側で合流)
+VEC_DYN_IDX = tuple(range(0, 11)) + tuple(range(51, 55))  # gyro+accel+gate検出+last_action = 15
+
+# --- 時系列・視覚特徴の契約 ---
+HIST_K = 6                       # 方策が見る観測履歴長 [決定ステップ] ≈0.2s @30Hz
+ENCODER_NAME = "dinov2_vits14"   # 凍結視覚エンコーダ(torch.hub facebookresearch/dinov2)
+FEAT_DIM = 384                   # ViT-S埋め込み次元
 
 # --- priv レイアウト(39次元) ---
 PRIV_DIM = 39
@@ -110,5 +117,6 @@ def contract_hash() -> str:
         f"vec{VEC_DIM}-priv{PRIV_DIM}-act{ACTION_DIM}"
         f"-rate{RATE_LIMITS}-thr{THRUST_CENTER}+-{THRUST_HALFSPAN}"
         f"-hz{POLICY_HZ}-res{RESNET_RES}-maxg{MAX_GATES}"
+        f"-{ENCODER_NAME}-feat{FEAT_DIM}-hist{HIST_K}"
     )
     return hashlib.sha256(spec.encode()).hexdigest()[:16]

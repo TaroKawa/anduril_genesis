@@ -175,9 +175,11 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
             next_eval += cfg.run.eval_interval
 
         if matured is not None:
-            q_trans.put(("main", _to_cpu(matured)))
+            with collector.prof.section("queue_put"):
+                q_trans.put(("main", _to_cpu(matured)))
         if succ is not None:
-            q_trans.put(("succ", _to_cpu(succ)))
+            with collector.prof.section("queue_put"):
+                q_trans.put(("succ", _to_cpu(succ)))
         for info in ep_infos:
             q_metrics.put({"type": "episode", "transitions": collector.transitions, "info": info})
 

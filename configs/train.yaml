@@ -11,7 +11,7 @@ env:
 
 sac:
   batch_size: 1024
-  replay_capacity: 1000000
+  replay_capacity: 250000  # 履歴窓(K=6)分メモリが増えるため縮小(fp16で約3GB)
   n_step: 3
   success_ratio: 0.5
   burn_in_steps: 50000
@@ -22,7 +22,7 @@ sac:
 curriculum:
   enabled: true
   window: 200
-  thresholds: [0.7, 0.7, 0.6, 0.5]
+  thresholds: [0.7, 0.7, 0.7, 0.6, 0.5]  # 5境界(6ステージ: 直線/近接緩/緩/フル/プール/速度)
   rebuild_episodes: 1000  # 再構築1回≈10秒停止。頻度を下げてチャーンを削減
   seed_pool: 32
   resume_hi: 0.8        # 逆カリキュラム: 成功率0時の途中スポーン確率(→各stageの下限へ線形減衰)
@@ -32,6 +32,7 @@ run:
   ckpt_dir: checkpoints
   eval_interval: 250000
   eval_video: true
+  profile: true         # 一時的: collectorステップ内訳の計測(計測後falseに戻す)
 
 hw:
   collector_gpu: "3070" # デバイス名の部分一致

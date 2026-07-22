@@ -96,8 +96,9 @@ class CourseGenerator:
     """棄却サンプリング付きランダムウォークで18ゲートコースを生成。
 
     stage 0: 直線(離陸+ゲート1用の易しいコース)
-    stage 1: 緩カーブ(Δψ≤25°、高低差控えめ)
-    stage 2+: フルレンジ(Δψ≤50°、高度1.5-4.5m + 急上昇/急降下区間~7m)
+    stage 1: 近接緩カーブ(ゲート間隔5-8m。次ゲートがすぐ視界に入る中間難度)
+    stage 2: 緩カーブ(Δψ≤40°、高低差控えめ、標準間隔)
+    stage 3+: フルレンジ(Δψ≤90°、高度1.5-4.5m + 急上昇/急降下区間~7m)
     """
 
     def __init__(self, seed: int, stage: int = 2, n_gates: int = 18, hall: HallSpec | None = None):
@@ -122,14 +123,22 @@ class CourseGenerator:
         if self.stage <= 0:
             return dict(dpsi_max=np.radians(8), z_range=(1.8, 2.2), climbs=0,
                         n_gates=min(self.n_gates, 8), seg=(8.0, 12.0),
-                        tilt=0.0, sharp_p=0.0)
+                        tilt=0.0, sharp_p=0.0, min_gap=6.0)
         if self.stage == 1:
+            # 近接緩カーブ: ゲートを詰めて置く(通過→次ゲートがすぐ視界に入り
+            # 報酬までの距離が短い)。直線→緩カーブへの中間難度。
+            # far_frac<1でホール奥行きの使用分を絞る(奥行き予算がゲート間隔を
+            # 決めるため、segを狭めるだけでは間隔が縮まらない)
+            return dict(dpsi_max=np.radians(25), z_range=(1.6, 2.6), climbs=0,
+                        n_gates=self.n_gates, seg=(4.5, 7.0),
+                        tilt=np.radians(3), sharp_p=0.0, min_gap=4.0, far_frac=0.8)
+        if self.stage == 2:
             return dict(dpsi_max=np.radians(40), z_range=(1.5, 3.5), climbs=0,
                         n_gates=self.n_gates, seg=(7.0, 13.0),
-                        tilt=np.radians(5), sharp_p=0.1)
+                        tilt=np.radians(5), sharp_p=0.1, min_gap=6.0)
         return dict(dpsi_max=np.radians(90), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
                     n_gates=self.n_gates, seg=(6.0, 13.0),
-                    tilt=np.radians(12), sharp_p=0.25)
+                    tilt=np.radians(12), sharp_p=0.25, min_gap=6.0)
 
     def _try_generate(self, rng) -> CourseSpec | None:
         """始点(ホール手前)→終点(奥)へ縦方向に進行するコース。
@@ -145,6 +154,8 @@ class CourseGenerator:
 
         # スタートゲート: ホール手前側、+N向き
         start = np.array([-hall.length / 2 + hall.margin + 3.0, rng.uniform(-4.0, 4.0), -1.8])
+        # 近接ステージ: 使う奥行きを絞ってゲート間隔を詰める
+        far_limit = start[0] + (far_limit - start[0]) * p.get("far_frac", 1.0)
         centers = [start]
         headings = [0.0]
         psi = 0.0
@@ -195,7 +206,7 @@ class CourseGenerator:
                 cand[2] = z
                 if not self._in_hall(cand):
                     continue
-                if any(np.linalg.norm(cand - c) < 6.0 for c in centers):
+                if any(np.linalg.norm(cand - c) < p["min_gap"] for c in centers):
                     continue
                 # 自己交差防止: 新ゲートが既存セグメントに近すぎない/新セグメントが
                 # 既存ゲートに近すぎない(コースが他ゲートの枠を突き抜けるのを防ぐ)

@@ -13,7 +13,6 @@ import torch
 
 from .. import contracts as C
 from ..config import TrainConfig
-from ..models.encoder import FrozenResNet18
 from .checkpoint import save_checkpoint
 from .loggers import TrainLogger
 from .replay import MixedSampler, ReplayBuffer
@@ -25,10 +24,12 @@ class Learner:
         self.cfg = cfg
         self.device = device
         self.agent = SacAgent(cfg.sac, device)
-        self.replay = ReplayBuffer(cfg.sac.replay_capacity, C.VEC_DIM, C.PRIV_DIM, C.ACTION_DIM,
-                                   FrozenResNet18.FEAT_DIM, device)
-        self.success = ReplayBuffer(cfg.sac.success_capacity, C.VEC_DIM, C.PRIV_DIM, C.ACTION_DIM,
-                                    FrozenResNet18.FEAT_DIM, device)
+        vec_shape = (C.HIST_K, C.VEC_DIM)
+        feat_shape = (C.HIST_K, C.FEAT_DIM)
+        self.replay = ReplayBuffer(cfg.sac.replay_capacity, vec_shape, C.PRIV_DIM, C.ACTION_DIM,
+                                   feat_shape, device)
+        self.success = ReplayBuffer(cfg.sac.success_capacity, vec_shape, C.PRIV_DIM, C.ACTION_DIM,
+                                    feat_shape, device)
         self.sampler = MixedSampler(self.replay, self.success)
         self.sampler.success_ratio = cfg.sac.success_ratio
         self.logger = TrainLogger(cfg.run.ckpt_dir)
@@ -92,6 +93,6 @@ class Learner:
                                 env_transitions=self.transitions, stage=self.stage)
 
     def update_success_ratio(self, stage: int):
-        # Stage2以降(ゲート3+を安定通過)は成功バッファ依存を下げる
+        # Stage3以降(フルコースを安定通過)は成功バッファ依存を下げる
         self.stage = stage
-        self.sampler.success_ratio = 0.25 if stage >= 2 else self.cfg.sac.success_ratio
+        self.sampler.success_ratio = 0.25 if stage >= 3 else self.cfg.sac.success_ratio

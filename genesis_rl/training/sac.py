@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from ..config import SacConfig
 from ..models.actor import SACActor
-from ..models.critic import TwinQ, make_obs_critic, make_priv_critic
+from ..models.critic import make_obs_critic, make_priv_critic
 
 
 @dataclass
@@ -87,7 +87,7 @@ class SacAgent:
             na, nlogp, _ = self.actor.sample(nfeat, nvec)
             tq_priv = self.q_priv_target.min_q(npriv, na) - alpha * nlogp
             y_priv = rew + gpow * tq_priv
-            tq_obs = self.q_obs_target.min_q(torch.cat([nfeat, nvec], dim=1), na) - alpha * nlogp
+            tq_obs = self.q_obs_target.min_q(nfeat, nvec, na) - alpha * nlogp
             y_obs = rew + gpow * tq_obs
 
         # --- Q_priv ---
@@ -98,8 +98,7 @@ class SacAgent:
         self.opt_q_priv.step()
 
         # --- Q_obs(補助・actorへは影響しない) ---
-        obs_in = torch.cat([feat, vec], dim=1)
-        o1, o2 = self.q_obs(obs_in, act)
+        o1, o2 = self.q_obs(feat, vec, act)
         loss_q_obs = F.mse_loss(o1, y_obs) + F.mse_loss(o2, y_obs)
         self.opt_q_obs.zero_grad(set_to_none=True)
         loss_q_obs.backward()
