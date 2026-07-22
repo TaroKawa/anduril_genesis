@@ -35,16 +35,21 @@ class Collector:
         env_cfg.clutter = spec.clutter
         self.env = GenesisRaceEnv(env_cfg, num_envs=env_cfg.num_envs, course_seed=course_seed,
                                   stage=spec.course_stage)
-        self.env.set_stage_runtime(noise_scale=spec.noise_scale, resume_prob=spec.resume_prob,
+        self.curriculum = CurriculumManager(cfg.curriculum, start_stage=stage)
+        # collectorはプロセス再起動で作り直されるため、シード連番を現seedから復元する
+        # (これがないとnext_course_seedが毎回base+1を返し、同一コースを再構築し続ける)
+        self.curriculum.seed_counter = max(0, course_seed - cfg.env.course_seed)
+        self.env.set_stage_runtime(noise_scale=spec.noise_scale,
+                                   resume_prob=self.curriculum.resume_prob_now(),
                                    required_gates=min(spec.required_gates, self.env.n_gates - 1),
                                    speed_finish_w=spec.speed_finish_w)
         self.N = self.env.num_envs
         self.encoder = FrozenResNet18(bf16=cfg.sac.encoder_bf16).to(self.env.device).eval()
+        self._blank_feat = None  # ゼロ画像のResNet特徴(定数)のキャッシュ
         self.actor = SACActor(hidden=cfg.sac.hidden).to(self.env.device).eval()
         self.nstep = NStepAssembler(self.N, cfg.sac.n_step, cfg.sac.gamma,
                                     C.VEC_DIM, C.PRIV_DIM, C.ACTION_DIM,
                                     FrozenResNet18.FEAT_DIM, self.env.device)
-        self.curriculum = CurriculumManager(cfg.curriculum, start_stage=stage)
         self.transitions = 0
         self._obs = None
         self._priv = None
@@ -54,7 +59,22 @@ class Collector:
     # --- 内部 ---
 
     def _encode(self, rgb_u8: torch.Tensor) -> torch.Tensor:
-        return self.encoder(C.to_resnet(rgb_u8))
+        """レンダ対象外env(画像が全ゼロ)はResNetを通さず定数特徴で埋める。
+
+        sequentialバックエンドではnum_envsのうち16envしか実画像を持たないため、
+        全envをResNetに通すのは大半が同一のゼロ画像の再計算になる。出力は
+        全件エンコードと厳密に一致する(ゼロ画像→定数ベクトル)。
+        """
+        nz = rgb_u8.flatten(1).any(dim=1)
+        if nz.all():
+            return self.encoder(C.to_resnet(rgb_u8))
+        if self._blank_feat is None:
+            blank = torch.zeros(1, *rgb_u8.shape[1:], dtype=rgb_u8.dtype, device=rgb_u8.device)
+            self._blank_feat = self.encoder(C.to_resnet(blank))[0]
+        out = self._blank_feat.expand(rgb_u8.shape[0], -1).clone()
+        if nz.any():
+            out[nz] = self.encoder(C.to_resnet(rgb_u8[nz]))
+        return out
 
     def warmup(self):
         self._obs, self._priv = self.env.reset()
@@ -121,12 +141,19 @@ class Collector:
         idx = info["done_idx"].tolist()
         gates = info["done_gates"].tolist()
         succ = info["done_success"].tolist()
-        for i, g, s in zip(idx, gates, succ):
+        spawn_g = info["done_spawn_gate"].tolist()
+        spawn_d = info["done_spawn_dist_g1"].tolist()
+        for i, g, s, sg, sd in zip(idx, gates, succ, spawn_g, spawn_d):
             ep_infos.append({"gates": int(g), "success": bool(s),
                              "collision": bool(info["collision"][i]),
                              "finish": bool(info["finish"][i]),
+                             "spawn_gate": int(sg), "spawn_dist_g1": float(sd),
+                             "resume_prob": float(self.env.resume_prob),
+                             "stage": int(self.curriculum.stage),
                              "episode_sums": info.get("episode", {})})
         self.curriculum.record_episodes([bool(s) for s in succ])
+        # 逆カリキュラム: 成功率の変化に追従して途中スポーン確率を更新
+        self.env.set_stage_runtime(resume_prob=self.curriculum.resume_prob_now())
 
         # 成功エピソード(ゲート数はenv.required_gates基準のsuccessフラグで判定済み)の
         # 遷移をキャッシュから抽出(1-step、gpow=γ)

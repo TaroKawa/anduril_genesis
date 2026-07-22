@@ -138,6 +138,8 @@ class GenesisRaceEnv:
         N = self.num_envs
         z = lambda *sh, dtype=torch.float32: torch.zeros(*sh, device=self.device, dtype=dtype)
         self.active_gate = z(N, dtype=torch.long) + 1     # 次に通過すべきゲート(0=スタートゲートの中でスポーン)
+        self.spawn_gate = z(N, dtype=torch.long) + 1      # スポーン時のactive_gate(成功判定はここからの相対通過数)
+        self.spawn_dist_g1 = z(N)                         # スポーン位置→ゲート1中心の距離 [m](カリキュラム可視化用)
         self.prev_x_rel = z(N)
         self.episode_steps = z(N, dtype=torch.long)       # 物理ステップ
         self.steps_since_gate = z(N, dtype=torch.long)
@@ -202,10 +204,12 @@ class GenesisRaceEnv:
         yaw = self.gate_yaw[0].expand(n).clone() + (torch.rand(n, device=dev) * 2 - 1) * jd
         active = torch.ones(n, device=dev, dtype=torch.long)
 
-        # 途中スポーン(カリキュラム): ゲートkの2m手前・ゲート正対
+        # 途中スポーン(逆カリキュラム): 全ゲートのいずれかの2m手前・ゲート正対。
+        # resume_probはcollectorが成功率に応じてアニールする(下手なうちはコース中の
+        # ゲート直前から「1個通す」練習を全域で積み、上達したら正規スタートへ寄せる)
         if self.resume_prob > 0.0 and self.n_gates > 2:
             resume = torch.rand(n, device=dev) < self.resume_prob
-            k = torch.randint(1, min(5, self.n_gates - 1), (n,), device=dev)
+            k = torch.randint(1, self.n_gates, (n,), device=dev)
             gp = self.gate_pos[k]
             gn = self.gate_normal[k]
             rp = gp - gn * 2.0
@@ -230,6 +234,9 @@ class GenesisRaceEnv:
         self.act_delay[envs_idx] = s.act_delay_steps + torch.randint(0, s.act_delay_jitter + 1, (n,), device=dev)
 
         self.active_gate[envs_idx] = active
+        self.spawn_gate[envs_idx] = active
+        g1 = min(1, self.n_gates - 1)
+        self.spawn_dist_g1[envs_idx] = (pos - self.gate_pos[g1]).norm(dim=1)
         self._update_ribbon(envs_idx)
         self._update_glow(envs_idx)
         self.episode_steps[envs_idx] = 0
@@ -306,8 +313,10 @@ class GenesisRaceEnv:
         time_outs = (timeout_gate | timeout_ep) & ~self.collision & ~finish
         done = self.collision | finish | time_outs
 
-        gates_passed = (self.active_gate - 1).clamp(min=0)
-        success = gates_passed >= self.required_gates
+        # 成功はスポーン地点からの相対通過数で判定(途中スポーンにスキップ分の
+        # クレジットを与えない)。終盤スポーンでrequired本残っていない場合はfinishで成功。
+        gates_passed = (self.active_gate - self.spawn_gate).clamp(min=0)
+        success = (gates_passed >= self.required_gates) | finish
         info = {
             "time_outs": time_outs,
             "gates_passed": gates_passed.clone(),
@@ -321,6 +330,8 @@ class GenesisRaceEnv:
             info["done_idx"] = idx
             info["done_gates"] = gates_passed[idx].clone()
             info["done_success"] = success[idx].clone()
+            info["done_spawn_gate"] = self.spawn_gate[idx].clone()
+            info["done_spawn_dist_g1"] = self.spawn_dist_g1[idx].clone()
             # 終端時の最終観測(n-stepのnext_obs用)。返り値のobsはリセット後に差し替える。
             info["final_obs"] = {"rgb": obs["rgb"][idx].clone(), "vec": obs["vec"][idx].clone()}
             info["final_priv"] = priv[idx].clone()

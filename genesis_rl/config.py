@@ -119,6 +119,7 @@ class CurriculumConfig:
     thresholds: tuple = (0.7, 0.7, 0.6, 0.5)  # stage0→1,1→2,2→3,3→4
     rebuild_episodes: int = 300           # シーン再構築(コース/色DR)間隔
     seed_pool: int = 32                   # Stage3+のコースシード数
+    resume_hi: float = 0.8                # 逆カリキュラム: 成功率0時の途中スポーン確率(閾値到達で各stageの下限へ線形減衰)
 
 
 @dataclass

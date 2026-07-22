@@ -15,12 +15,22 @@ class TrainLogger:
         self.ep_gates = deque(maxlen=2000)
         self.ep_success = deque(maxlen=2000)
         self.ep_return = deque(maxlen=2000)
+        self.ep_spawn_gate = deque(maxlen=2000)
+        self.ep_spawn_dist = deque(maxlen=2000)
+        self._resume_prob = None
+        self._stage = None
         self._history = {"transitions": [], "gates": [], "success": [], "return": []}
 
     def log_episode(self, transitions: int, info: dict):
         self.ep_gates.append(info["gates"])
         self.ep_success.append(1.0 if info["success"] else 0.0)
         self.ep_return.append(info.get("episode_sums", {}).get("total", 0.0))
+        if "spawn_gate" in info:
+            self.ep_spawn_gate.append(info["spawn_gate"])
+        if "spawn_dist_g1" in info:
+            self.ep_spawn_dist.append(info["spawn_dist_g1"])
+        self._resume_prob = info.get("resume_prob", self._resume_prob)
+        self._stage = info.get("stage", self._stage)
 
     def log_scalars(self, step: int, scalars: dict, prefix: str = ""):
         for k, v in scalars.items():
@@ -35,6 +45,15 @@ class TrainLogger:
             "episode/success_rate": sum(self.ep_success) / len(self.ep_success),
             "episode/return_mean": sum(self.ep_return) / len(self.ep_return),
         }
+        # 逆カリキュラムの現在地(どこからスポーンしているか・正規スタートへの移行度)
+        if self.ep_spawn_gate:
+            stats["curriculum/spawn_gate_mean"] = sum(self.ep_spawn_gate) / len(self.ep_spawn_gate)
+        if self.ep_spawn_dist:
+            stats["curriculum/spawn_dist_gate1_mean"] = sum(self.ep_spawn_dist) / len(self.ep_spawn_dist)
+        if self._resume_prob is not None:
+            stats["curriculum/resume_prob"] = self._resume_prob
+        if self._stage is not None:
+            stats["curriculum/stage"] = self._stage
         self.log_scalars(transitions, stats)
         h = self._history
         h["transitions"].append(transitions)

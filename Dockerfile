@@ -6,6 +6,7 @@ FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates \
+        build-essential \
         libegl1 libgl1 libglvnd0 libgles2 libglib2.0-0 libx11-6 libxext6 \
         libvulkan1 ffmpeg xvfb \
     && rm -rf /var/lib/apt/lists/*

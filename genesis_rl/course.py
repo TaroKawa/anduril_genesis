@@ -288,14 +288,21 @@ def ribbon_segments(spec: CourseSpec, width: float = 1.8) -> list[tuple[np.ndarr
     return segs
 
 
-def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
-    """リボン(発光ガイドパス)の三角形ストリップを生成。NED座標のまま返す。
+def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8,
+                thickness: float = 0.03) -> tuple[np.ndarray, np.ndarray]:
+    """リボン(発光ガイドパス)の薄い角柱メッシュを生成。NED座標のまま返す。
 
     帯の面の向きはパスの接線に追従し、水平区間では水平帯・急上昇区間では
     実映像同様の垂直な壁状バンドに自然になる(側方ベクトル=接線×鉛直、
     接線が鉛直に近づくと側方を水平面内に固定)。
-    returns (vertices (2M,3), faces (2(M-1),3))
+
+    厚みゼロの帯だと直線区間で凸包体積=0となり、非固定エンティティの慣性が
+    特異になって剛体ソルバの質量行列がNaN化する(バッチ全envの制約ソルバが
+    死ぬ)ため、watertightな閉じた角柱として返す。
+    returns (vertices, faces)
     """
+    import trimesh
+
     pts = ribbon_pts
     t = np.gradient(pts, axis=0)
     t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
@@ -305,14 +312,31 @@ def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8) -> tuple[np.ndarray,
     # 接線がほぼ鉛直の区間: 側方をE軸に固定
     side = np.where(n > 0.2, side / np.maximum(n, 1e-9), np.array([0.0, 1.0, 0.0]))
     side /= np.linalg.norm(side, axis=1, keepdims=True)
+    nrm = np.cross(t, side)
+    nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-9
 
     v0 = pts + side * (width / 2)
     v1 = pts - side * (width / 2)
-    verts = np.empty((2 * len(pts), 3))
-    verts[0::2] = v0
-    verts[1::2] = v1
+    layer = np.empty((2 * len(pts), 3))
+    layer[0::2] = v0
+    layer[1::2] = v1
+    off = np.repeat(nrm * (thickness / 2), 2, axis=0)
+    M = len(pts)
+    verts = np.vstack([layer - off, layer + off])  # [0:2M)=下面, [2M:4M)=上面
+
     faces = []
-    for i in range(len(pts) - 1):
+    B = 2 * M
+    for i in range(M - 1):
         a, b, c, d = 2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3
-        faces += [[a, b, c], [b, d, c]]
-    return verts, np.array(faces, dtype=np.int64)
+        faces += [[a, b, c], [b, d, c]]                          # 下面
+        faces += [[B + a, B + c, B + b], [B + b, B + c, B + d]]  # 上面(逆巻き)
+        faces += [[a, c, B + c], [a, B + c, B + a]]              # 側壁(v0側)
+        faces += [[b, B + d, d], [b, B + b, B + d]]              # 側壁(v1側)
+    e0, e1 = 2 * (M - 1), 2 * (M - 1) + 1
+    faces += [[0, B + 1, 1], [0, B, B + 1]]                      # 端キャップ(始点)
+    faces += [[e0, e1, B + e1], [e0, B + e1, B + e0]]            # 端キャップ(終点)
+
+    # 頂点マージ+法線の向きを外向きに統一(慣性計算がwatertight判定に依存するため)
+    tm = trimesh.Trimesh(vertices=verts, faces=np.array(faces, dtype=np.int64), process=True)
+    trimesh.repair.fix_normals(tm)
+    return np.asarray(tm.vertices), np.asarray(tm.faces, dtype=np.int64)

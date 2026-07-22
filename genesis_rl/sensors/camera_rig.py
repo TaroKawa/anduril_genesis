@@ -45,6 +45,13 @@ def chase_offset_T(back: float = 3.0, up: float = 1.2, pitch_down_deg: float = 1
 def resolve_backend(requested: str) -> str:
     if requested in ("sequential", "none"):
         return requested
+    import os
+    if os.path.exists("/dev/dxg"):
+        # WSL2にはNVIDIAのVulkan ICDがなく、MadronaはVulkan初期化で
+        # ERROR_INCOMPATIBLE_DRIVERで即死する(importは成功するので例外では拾えない)
+        if requested == "batch":
+            print("[camera_rig] WSL2ではMadrona(Vulkan)が動かないため sequential にフォールバックします")
+        return "sequential"
     try:
         import gs_madrona  # noqa: F401
         return "batch"

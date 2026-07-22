@@ -242,8 +242,9 @@ class SceneBuilder:
             verts_w = verts_ned.copy()
             verts_w[:, 1] *= -1.0
             verts_w[:, 2] *= -1.0
-            mesh = trimesh.Trimesh(vertices=verts_w,
-                                   faces=np.concatenate([faces, faces[:, ::-1]]), process=False)
+            # ribbon_meshはwatertightな角柱を返す(両面化の面複製はwatertight性を
+            # 壊して慣性推定を凸包フォールバックさせるので行わない)
+            mesh = trimesh.Trimesh(vertices=verts_w, faces=faces, process=False)
             f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
             mesh.export(f.name)
             # 半透明+発光(Rough=Plastic系はopacity_texture対応。Emissionは不透明のみ)

@@ -61,6 +61,8 @@ def run_sync(cfg, resume: str | None = None, smoke: bool = False):
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(_pick_gpu_index(cfg.hw.collector_gpu, 0)))
     import torch
 
+    torch.set_float32_matmul_precision("high")  # Ampere: TF32行列積(数値影響は無視できる)
+
     from .collector import Collector
     from .learner import Learner
     from .checkpoint import load_checkpoint, find_latest
@@ -144,6 +146,8 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import torch
 
+    torch.set_float32_matmul_precision("high")
+
     from .collector import Collector
     from .. import contracts as C
 
@@ -217,6 +221,8 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights, q_
 
     import torch
 
+    torch.set_float32_matmul_precision("high")
+
     from .checkpoint import find_latest, load_checkpoint
     from .learner import Learner
 
@@ -237,13 +243,19 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights, q_
     last_stats = time.time()
     while not stop_ev.is_set() and learner.transitions < cfg.sac.total_transitions:
         drained = 0
-        try:
-            while drained < 128:
+        while drained < 128:
+            try:
                 kind, batch = q_trans.get_nowait()
-                learner.add_transitions(batch, success=(kind == "succ"))
-                drained += 1
-        except pyqueue.Empty:
-            pass
+            except pyqueue.Empty:
+                break
+            except (FileNotFoundError, ConnectionError, EOFError, OSError) as e:
+                # カリキュラム再構築でcollectorが自主終了した直後は、キュー在庫の
+                # 共有テンソルFDの提供元(旧collectorのresource_sharer)が消えていて
+                # 逆シリアライズに失敗する。在庫を捨てて続行(数バッチの損失は無害)。
+                print(f"[learner] dropped stale batch from dead collector ({type(e).__name__})")
+                continue
+            learner.add_transitions(batch, success=(kind == "succ"))
+            drained += 1
 
         if learner.update_once() is None and drained == 0:
             time.sleep(0.005)
