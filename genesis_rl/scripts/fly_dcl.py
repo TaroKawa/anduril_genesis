@@ -12,6 +12,8 @@
 
 Ctrl+Cで終了。受信FPV映像(HUD付き)は --out のmp4へ逐次保存される。
 チェックポイントの新旧アーキテクチャ(ResNet18+MLP / DINOv2+時系列)は自動判別。
+ゲート検出は既定でYOLOX-x(YOLOX_outputs_x/yolox_x_custom/best_ckpt.pth)。緑の
+十字HUDは検出したゲート中心。重みが無い場合は自動でHSV色検出にフォールバック。
 """
 
 from __future__ import annotations
@@ -32,13 +34,19 @@ def main():
     ap.add_argument("--no-reset-on-collision", action="store_true")
     ap.add_argument("--no-relay", action="store_true",
                     help="Windows側リレーの自動起動を無効化(手動起動する場合)")
+    from ..dcl.client import DEFAULT_YOLOX_CKPT
+    ap.add_argument("--gate-detector", choices=["yolox", "hsv"], default="yolox",
+                    help="ゲート検出方式(既定=yolox。重み欠落時は自動でhsvへフォールバック)")
+    ap.add_argument("--yolox-ckpt", type=str, default=DEFAULT_YOLOX_CKPT,
+                    help="YOLOX-x 重み(best_ckpt.pth)のパス")
     args = ap.parse_args()
 
     from ..dcl.client import run
 
     run(ckpt=args.ckpt, mavlink_ip=args.mavlink_ip, mavlink_port=args.mavlink_port,
         video_port=args.video_port, out_mp4=args.out or None, max_sec=args.max_sec,
-        reset_on_collision=not args.no_reset_on_collision, relay=not args.no_relay)
+        reset_on_collision=not args.no_reset_on_collision, relay=not args.no_relay,
+        gate_detector=args.gate_detector, yolox_ckpt=args.yolox_ckpt)
 
 
 if __name__ == "__main__":

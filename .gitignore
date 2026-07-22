@@ -6,3 +6,4 @@ checkpoints/
 .pytest_cache/
 
 checkpoints_old_resnet/
+*.pth

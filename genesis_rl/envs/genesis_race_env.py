@@ -43,6 +43,16 @@ def _ensure_gs_init(seed: int):
 
     if not _GS_INITIALIZED:
         gs.init(backend=gs.gpu, precision="32", seed=seed, logging_level="warning")
+        # gs.init()はtorch.set_default_device()を呼ぶが、これは全torch API呼び出しに
+        # Pythonフック(DeviceContext.__torch_function__)を挟み、collectorのCPU時間の
+        # ~45%を占める(py-spy実測)。genesis_rl側のテンソル生成は全てdevice明示、
+        # Genesis内部もgs.device明示(n_envs==0分岐を除く)なので、モードを外す。
+        # default dtype(float32)の設定はそのまま生きる。
+        # A/B検証・切り戻し用: GENESIS_RL_KEEP_DEFAULT_DEVICE=1 で従来挙動。
+        import os
+
+        if os.environ.get("GENESIS_RL_KEEP_DEFAULT_DEVICE") != "1":
+            torch.set_default_device(None)
         _GS_INITIALIZED = True
     return gs
 
