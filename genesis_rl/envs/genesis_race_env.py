@@ -231,6 +231,7 @@ class GenesisRaceEnv:
 
         self.active_gate[envs_idx] = active
         self._update_ribbon(envs_idx)
+        self._update_glow(envs_idx)
         self.episode_steps[envs_idx] = 0
         self.steps_since_gate[envs_idx] = 0
         self.last_action[envs_idx] = 0.0
@@ -268,9 +269,13 @@ class GenesisRaceEnv:
             self.steps_since_gate += 1
 
         self.prev_cmd = cmd_new
-        # ゲート通過したenvはリボンの表示窓を進める(通過区間を消し、5ゲート先まで出す)
+        # ゲート通過したenvはリボン表示窓と床グロー(次ゲートのみ点灯)を進める
         if self.gate_pass_flag.any():
-            self._update_ribbon(self.gate_pass_flag.nonzero(as_tuple=False).squeeze(1))
+            passed_idx = self.gate_pass_flag.nonzero(as_tuple=False).squeeze(1)
+            self._update_ribbon(passed_idx)
+            self._update_glow(passed_idx)
+        # 青パスの点滅(全env共通の明滅、区間ごとに位相ずれ)
+        self._tick_blink()
         # --- フレーム境界(30Hz): レンダ + 検出 ---
         rgb = self.rig.render()
         self.img_queue.push(rgb)
@@ -367,10 +372,13 @@ class GenesisRaceEnv:
         # 通過したenvはprev_x_relが新ゲート基準に更新済み。それ以外は現在値へ。
         self.prev_x_rel = torch.where(passed, self.prev_x_rel, x_rel)
 
-    RIBBON_AHEAD = 5  # 青パスはアクティブゲートから5ゲート先まで表示
+    RIBBON_AHEAD = 5      # 青パスはアクティブゲートから5ゲート先まで表示
+    BLINK_PERIOD = 18     # 点滅周期 [決定ステップ] = 0.6s @30Hz
+    BLINK_ON = 13         # うち点灯ステップ数(デューティ~72%)
+    BLINK_PHASE = 4       # 区間ごとの位相ずれ(流れるような明滅)
 
-    def _update_ribbon(self, envs_idx: torch.Tensor):
-        """リボン区間の表示窓を更新。通過済み区間は床下(-80m)へ沈めて非表示にする。
+    def _update_ribbon(self, envs_idx: torch.Tensor, segments: list[int] | None = None):
+        """リボン区間の表示を更新(表示窓 ∧ 点滅状態)。非表示は床下(-80m)へ沈める。
 
         区間エンティティは非固定+gravity_compensation=1.0なのでper-envにset_posできる。
         """
@@ -380,14 +388,45 @@ class GenesisRaceEnv:
         if not hasattr(self, "_ribbon_home"):
             # build直後の基準位置をキャプチャ(メッシュ再センタリングに依存しないため)
             self._ribbon_home = [ent.get_pos()[0].clone() for ent in ents]
+            self._blink_on = torch.ones(len(ents), device=self.device, dtype=torch.bool)
         active = self.active_gate[envs_idx]
         sink = torch.tensor([0.0, 0.0, -80.0], device=self.device)
-        for k, ent in enumerate(ents):
+        for k in (range(len(ents)) if segments is None else segments):
             gate_i = k + 1  # この区間が導くゲート番号
-            vis = (active <= gate_i) & (gate_i < active + self.RIBBON_AHEAD)
+            vis = (active <= gate_i) & (gate_i < active + self.RIBBON_AHEAD) & self._blink_on[k]
             home = self._ribbon_home[k].expand(len(envs_idx), 3)
-            ent.set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
-                        envs_idx=envs_idx, zero_velocity=True, relative=False)
+            ents[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
+                            envs_idx=envs_idx, zero_velocity=True, relative=False)
+
+    def _tick_blink(self):
+        """点滅状態を1決定ステップ進め、変化した区間だけ全envで表示を更新する。"""
+        if not hasattr(self, "_blink_tick"):
+            self._blink_tick = 0
+        self._blink_tick += 1
+        ents = getattr(self.builder, "ribbon_entities", [])
+        if not ents or not hasattr(self, "_blink_on"):
+            return
+        k_ar = torch.arange(len(ents), device=self.device)
+        on = ((self._blink_tick + k_ar * self.BLINK_PHASE) % self.BLINK_PERIOD) < self.BLINK_ON
+        changed = (on != self._blink_on).nonzero(as_tuple=False).squeeze(1)
+        self._blink_on = on
+        if len(changed) > 0:
+            self._update_ribbon(self._all_idx, segments=changed.tolist())
+
+    def _update_glow(self, envs_idx: torch.Tensor):
+        """床の金色グローは「次に行くべきゲート」1つだけ点灯する。"""
+        glows = getattr(self.builder, "glow_entities", [])
+        if not glows or len(envs_idx) == 0:
+            return
+        if not hasattr(self, "_glow_home"):
+            self._glow_home = [g.get_pos()[0].clone() for g in glows]
+        active = self.active_gate[envs_idx]
+        sink = torch.tensor([0.0, 0.0, -80.0], device=self.device)
+        for k, g in enumerate(glows):
+            vis = active == k
+            home = self._glow_home[k].expand(len(envs_idx), 3)
+            g.set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
+                      envs_idx=envs_idx, zero_velocity=True, relative=False)
 
     def _check_collision(self):
         contacts = self.drone_entity.get_contacts()

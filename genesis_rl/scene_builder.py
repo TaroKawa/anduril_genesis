@@ -183,6 +183,7 @@ class SceneBuilder:
 
     def _add_gates(self, scene, gs):
         c = self.colors
+        self.glow_entities = []
         for gi, gate in enumerate(self.course.gates):
             cw = np.array(ned2w(gate.center_ned))
             R_w = rot_ned_to_world(gate.rotation_ned())  # 列: x=法線, y=±側方, z=面内上方
@@ -216,13 +217,16 @@ class SceneBuilder:
                                   fixed=True, collision=False)
                 self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
 
-            # ゲート真下の床の金色グロー(実画像1,2)
-            self._static(
-                scene, gs,
+            # ゲート真下の床の金色グロー(実画像1,2)。
+            # 「次に行くべきゲート」だけ点灯させるため、リボン同様に非固定+重力補償で
+            # per-envに表示/非表示を切り替えられるエンティティにする。
+            glow = scene.add_entity(
                 gs.morphs.Box(pos=(cw[0], cw[1], 0.02), size=(2.2, 2.2, 0.02),
-                              fixed=True, collision=False),
-                None, emissive=c.glow_rgb,
+                              fixed=False, collision=False),
+                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
             )
+            self.glow_entities.append(glow)
 
     def _add_ribbon(self, scene, gs):
         """ゲートごとのリボン区間を個別エンティティで追加(動的表示用)。
@@ -242,11 +246,14 @@ class SceneBuilder:
                                    faces=np.concatenate([faces, faces[:, ::-1]]), process=False)
             f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
             mesh.export(f.name)
+            # 半透明+発光(Rough=Plastic系はopacity_texture対応。Emissionは不透明のみ)
+            r, g, b = self.colors.ribbon_rgb
             ent = scene.add_entity(
                 gs.morphs.Mesh(file=f.name, fixed=False, collision=False,
                                decimate=False, convexify=False),
                 material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                surface=gs.surfaces.Emission(color=tuple(self.colors.ribbon_rgb)),
+                surface=gs.surfaces.Rough(color=(r * 0.3, g * 0.3, b * 0.3),
+                                          emissive=(r, g, b), opacity=0.45),
             )
             self.ribbon_entities.append(ent)
 
