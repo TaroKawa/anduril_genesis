@@ -285,7 +285,7 @@ class GateYOLOX:
     def __init__(self, ckpt_path: str, device: torch.device,
                  num_classes: int = 1, input_size: tuple[int, int] = (640, 640),
                  conf_thre: float = 0.30, nms_thre: float = 0.45,
-                 fp16: bool | None = None):
+                 fp16: bool | None = None, gate_area_max: float | None = None):
         from ..contracts import GATE_AREA_MAX
 
         self.device = device
@@ -293,7 +293,9 @@ class GateYOLOX:
         self.conf_thre = conf_thre
         self.nms_thre = nms_thre
         self.num_classes = num_classes
-        self.gate_area_max = float(GATE_AREA_MAX)
+        # rel_dist = 1 - bbox面積/gate_area_max。実bboxはGenesis投影(s_px²)より小さいため
+        # 較正が必要(overrideで下げると接近時にrel_distが早く下がる)。既定は契約値。
+        self.gate_area_max = float(GATE_AREA_MAX if gate_area_max is None else gate_area_max)
         self.fp16 = (device.type == "cuda") if fp16 is None else fp16
 
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

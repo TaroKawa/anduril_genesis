@@ -59,8 +59,11 @@ def _ensure_gs_init(seed: int):
 
 class GenesisRaceEnv:
     def __init__(self, cfg: EnvConfig, num_envs: int | None = None, course_seed: int | None = None,
-                 stage: int | None = None, show_viewer: bool = False, extra_cameras: bool = False):
-        gs = _ensure_gs_init(cfg.course_seed)
+                 stage: int | None = None, show_viewer: bool = False, extra_cameras: bool = False,
+                 rng_seed: int | None = None):
+        # rng_seed: torch/numpyグローバルRNGのシード(マルチcollectorでrankごとにずらす。
+        # コース形状はcourse_seed固定なので、rankが違っても同一コース・別ノイズ系列になる)
+        gs = _ensure_gs_init(cfg.course_seed if rng_seed is None else rng_seed)
         self.gs = gs
         self.cfg = cfg
         self.num_envs = num_envs or cfg.num_envs
@@ -86,7 +89,8 @@ class GenesisRaceEnv:
         # --- シーン ---
         rng = np.random.default_rng(seed + 777)
         backend = resolve_backend(cfg.render.backend)
-        self.rig = CameraRig(backend, self.num_envs, cfg.render.width, cfg.render.height, self.device)
+        self.rig = CameraRig(backend, self.num_envs, cfg.render.width, cfg.render.height, self.device,
+                             max_seq_envs=cfg.render.max_seq_envs)
 
         renderer = None
         vis_kwargs = {}
@@ -402,6 +406,8 @@ class GenesisRaceEnv:
         """リボン区間の表示を更新(表示窓 ∧ 点滅状態)。非表示は床下(-80m)へ沈める。
 
         区間エンティティは非固定+gravity_compensation=1.0なのでper-envにset_posできる。
+        set_posはGenesis API 1回≈1.4msと高価なので、前回書いた表示状態(_ribbon_vis)
+        との差分がある(区間×env)だけ書く。ビルド直後は全区間homeにある(=表示)。
         """
         ents = getattr(self.builder, "ribbon_entities", [])
         if not ents or len(envs_idx) == 0:
@@ -410,14 +416,27 @@ class GenesisRaceEnv:
             # build直後の基準位置をキャプチャ(メッシュ再センタリングに依存しないため)
             self._ribbon_home = [ent.get_pos()[0].clone() for ent in ents]
             self._blink_on = torch.ones(len(ents), device=self.device, dtype=torch.bool)
+            self._ribbon_vis = torch.ones(self.num_envs, len(ents),
+                                          device=self.device, dtype=torch.bool)
         active = self.active_gate[envs_idx]
         sink = torch.tensor([0.0, 0.0, -80.0], device=self.device)
-        for k in (range(len(ents)) if segments is None else segments):
-            gate_i = k + 1  # この区間が導くゲート番号
-            vis = (active <= gate_i) & (gate_i < active + self.RIBBON_AHEAD) & self._blink_on[k]
-            home = self._ribbon_home[k].expand(len(envs_idx), 3)
+        gate_i = torch.arange(1, len(ents) + 1, device=self.device)  # 区間kが導くゲート番号
+        vis_all = ((active.unsqueeze(1) <= gate_i)
+                   & (gate_i < (active + self.RIBBON_AHEAD).unsqueeze(1))
+                   & self._blink_on)                                  # (n, K)
+        diff_all = vis_all != self._ribbon_vis[envs_idx]
+        if segments is not None:
+            seg_mask = torch.zeros(len(ents), device=self.device, dtype=torch.bool)
+            seg_mask[segments] = True
+            diff_all &= seg_mask
+        for k in diff_all.any(dim=0).nonzero(as_tuple=False).squeeze(1).tolist():
+            d = diff_all[:, k]
+            idx = envs_idx[d]
+            vis = vis_all[d, k]
+            home = self._ribbon_home[k].expand(len(idx), 3)
             ents[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
-                            envs_idx=envs_idx, zero_velocity=True, relative=False)
+                            envs_idx=idx, zero_velocity=True, relative=False)
+            self._ribbon_vis[idx, k] = vis
 
     def _tick_blink(self):
         """点滅状態を1決定ステップ進め、変化した区間だけ全envで表示を更新する。"""
@@ -435,19 +454,30 @@ class GenesisRaceEnv:
             self._update_ribbon(self._all_idx, segments=changed.tolist())
 
     def _update_glow(self, envs_idx: torch.Tensor):
-        """床の金色グローは「次に行くべきゲート」1つだけ点灯する。"""
+        """床の金色グローは「次に行くべきゲート」1つだけ点灯する。
+
+        _update_ribbonと同様、前回書いた状態(_glow_vis)との差分だけset_posする。
+        """
         glows = getattr(self.builder, "glow_entities", [])
         if not glows or len(envs_idx) == 0:
             return
         if not hasattr(self, "_glow_home"):
             self._glow_home = [g.get_pos()[0].clone() for g in glows]
+            self._glow_vis = torch.ones(self.num_envs, len(glows),
+                                        device=self.device, dtype=torch.bool)
         active = self.active_gate[envs_idx]
         sink = torch.tensor([0.0, 0.0, -80.0], device=self.device)
-        for k, g in enumerate(glows):
-            vis = active == k
-            home = self._glow_home[k].expand(len(envs_idx), 3)
-            g.set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
-                      envs_idx=envs_idx, zero_velocity=True, relative=False)
+        k_ar = torch.arange(len(glows), device=self.device)
+        vis_all = active.unsqueeze(1) == k_ar                        # (n, G)
+        diff_all = vis_all != self._glow_vis[envs_idx]
+        for k in diff_all.any(dim=0).nonzero(as_tuple=False).squeeze(1).tolist():
+            d = diff_all[:, k]
+            idx = envs_idx[d]
+            vis = vis_all[d, k]
+            home = self._glow_home[k].expand(len(idx), 3)
+            glows[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
+                             envs_idx=idx, zero_velocity=True, relative=False)
+            self._glow_vis[idx, k] = vis
 
     def _check_collision(self):
         contacts = self.drone_entity.get_contacts()

@@ -7,3 +7,4 @@ checkpoints/
 
 checkpoints_old_resnet/
 *.pth
+runs

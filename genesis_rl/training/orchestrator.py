@@ -142,7 +142,7 @@ def run_sync(cfg, resume: str | None = None, smoke: bool = False):
 # ---------------------------------------------------------------- async mode
 
 def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int,
-                   q_trans, q_weights, q_metrics, stop_ev):
+                   q_trans, q_weights, q_metrics, stop_ev, rebuild_ev=None, rank: int = 0):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import torch
 
@@ -152,16 +152,20 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
     from .. import contracts as C
 
     device = torch.device("cuda", 0)
-    collector = Collector(cfg, device, stage, seed)
+    collector = Collector(cfg, device, stage, seed, rank=rank)
     collector.transitions = transitions0
     collector.warmup()
-    q_metrics.put({"type": "info", "msg": f"collector up: stage={stage} seed={seed} "
+    q_metrics.put({"type": "info", "msg": f"collector{rank} up: stage={stage} seed={seed} "
                                           f"envs={collector.N} backend={collector.env.rig.backend}"})
     next_eval = collector.transitions + cfg.run.eval_interval
     eval_frames = []
     eval_left = 0
 
     while not stop_ev.is_set():
+        # rank0がカリキュラム再構築を宣言したら全collectorが自主終了(exit 3)して
+        # orchestratorに新stage/seedで再起動してもらう
+        if rebuild_ev is not None and rank != 0 and rebuild_ev.is_set():
+            break
         deterministic = eval_left > 0
         matured, succ, ep_infos = collector.step(deterministic=deterministic)
         if deterministic and cfg.run.eval_video:
@@ -170,7 +174,7 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
             if eval_left == 0 and eval_frames:
                 _save_eval_video(cfg, eval_frames, collector.transitions)
                 eval_frames = []
-        elif collector.transitions >= next_eval:
+        elif rank == 0 and collector.transitions >= next_eval:
             eval_left = int(20 * C.POLICY_HZ)
             next_eval += cfg.run.eval_interval
 
@@ -194,10 +198,12 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
             collector.load_actor_weights({k: v.to(device) for k, v in sd.items()})
 
         ev = collector.maybe_curriculum()
-        if ev is not None:
+        if ev is not None:  # rank0のみ(他rankはNone固定)
             q_metrics.put({"type": "curriculum", **ev})
             _curriculum_path(cfg).write_text(json.dumps(
                 {"stage": ev["stage"], "seed": ev["seed"], "transitions": collector.transitions}))
+            if rebuild_ev is not None:
+                rebuild_ev.set()  # 他rankにも自主終了を伝える
             break
 
     raise SystemExit(3 if not stop_ev.is_set() else 0)
@@ -217,7 +223,8 @@ def _save_eval_video(cfg, frames, transitions):
         print(f"[collector] eval video failed: {e}")
 
 
-def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights, q_metrics, stop_ev):
+def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_list, q_metrics,
+                 stop_ev):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import queue as pyqueue
 
@@ -278,12 +285,14 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights, q_
 
         now = time.time()
         if now - last_weights > cfg.sac.weight_sync_sec:
-            try:
-                while True:
-                    q_weights.get_nowait()
-            except pyqueue.Empty:
-                pass
-            q_weights.put(learner.actor_weights_cpu())
+            sd = learner.actor_weights_cpu()
+            for q_weights in q_weights_list:  # collectorごとに専用キュー(latest-only)
+                try:
+                    while True:
+                        q_weights.get_nowait()
+                except pyqueue.Empty:
+                    pass
+                q_weights.put(sd)
             last_weights = now
         if now - last_stats > 30.0:
             stats = learner.logger.flush_episode_stats(learner.transitions)
@@ -308,26 +317,37 @@ def run_async(cfg, resume: str | None = None):
     print(f"[orchestrator] collector=GPU{col_idx}('{cfg.hw.collector_gpu}') "
           f"learner=GPU{lrn_idx}('{cfg.hw.learner_gpu}')")
 
+    n_col = max(1, int(cfg.hw.num_collectors))
     ctx = tmp.get_context("spawn")
     q_trans = ctx.Queue(maxsize=256)
-    q_weights = ctx.Queue(maxsize=4)
+    q_weights_list = [ctx.Queue(maxsize=4) for _ in range(n_col)]
     q_metrics = ctx.Queue(maxsize=2048)
     stop_ev = ctx.Event()
-
-    stage, seed, _ = _load_curriculum_state(cfg)
+    rebuild_ev = ctx.Event()
 
     lp = ctx.Process(target=learner_main, name="learner",
-                     args=(cfg, lrn_idx, resume, q_trans, q_weights, q_metrics, stop_ev))
+                     args=(cfg, lrn_idx, resume, q_trans, q_weights_list, q_metrics, stop_ev))
     lp.start()
+
+    def _join_all(cps, timeout):
+        deadline = time.time() + timeout
+        for cp in cps:
+            cp.join(timeout=max(0.5, deadline - time.time()))
+            if cp.is_alive():
+                cp.terminate()
 
     exit_code = 1
     try:
         while True:
             stage, seed, trans0 = _load_curriculum_state(cfg)
-            cp = ctx.Process(target=collector_main, name="collector",
-                             args=(cfg, col_idx, stage, seed, trans0, q_trans, q_weights, q_metrics, stop_ev))
-            cp.start()
-            while cp.is_alive() and lp.is_alive():
+            rebuild_ev.clear()
+            cps = [ctx.Process(target=collector_main, name=f"collector{r}",
+                               args=(cfg, col_idx, stage, seed, trans0, q_trans,
+                                     q_weights_list[r], q_metrics, stop_ev, rebuild_ev, r))
+                   for r in range(n_col)]
+            for cp in cps:
+                cp.start()
+            while lp.is_alive() and all(cp.is_alive() for cp in cps):
                 time.sleep(2.0)
             if not lp.is_alive():
                 if lp.exitcode == 0:
@@ -337,18 +357,19 @@ def run_async(cfg, resume: str | None = None):
                     print(f"[orchestrator] learner died (code={lp.exitcode})")
                     exit_code = lp.exitcode or 1
                 stop_ev.set()
-                cp.join(timeout=30)
-                if cp.is_alive():
-                    cp.terminate()
+                _join_all(cps, timeout=30)
                 break
-            cp.join(timeout=10)
-            if cp.exitcode == 3:
-                print("[orchestrator] collector rebuild — restarting with new stage/seed")
+            # いずれかのcollectorが終了。rebuild(exit 3)なら全員を回収して再起動
+            _join_all(cps, timeout=60 if rebuild_ev.is_set() else 10)
+            codes = [cp.exitcode for cp in cps]
+            if rebuild_ev.is_set() or 3 in codes:
+                print(f"[orchestrator] collector rebuild (codes={codes}) — "
+                      "restarting with new stage/seed")
                 continue
-            if cp.exitcode == 0:
+            if 0 in codes:
                 exit_code = 0
                 break
-            print(f"[orchestrator] collector died (code={cp.exitcode}) — restarting in 10s")
+            print(f"[orchestrator] collector died (codes={codes}) — restarting in 10s")
             time.sleep(10.0)
     finally:
         stop_ev.set()

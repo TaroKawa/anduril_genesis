@@ -13,6 +13,7 @@ import yaml
 class HwConfig:
     collector_gpu: str = "3070"   # デバイス名の部分一致(WSL2は列挙順不定のため名前でマッチ)
     learner_gpu: str = "4060"
+    num_collectors: int = 1       # collectorプロセス数(env.num_envs/render.max_seq_envsはper-collector)
 
 
 @dataclass
@@ -21,6 +22,7 @@ class RenderConfig:
     width: int = 320              # 学習時レンダ解像度(本番intrinsicsの1/2、FoV同一)
     height: int = 180
     jpeg_dr: bool = False         # JPEG劣化DR(逐次モードのみ推奨)
+    max_seq_envs: int = 16        # sequentialバックエンドの実レンダenv数上限(per collector)
 
 
 @dataclass

@@ -39,16 +39,20 @@ def _hist_windows(seq: torch.Tensor, k: int) -> torch.Tensor:
 
 
 class Collector:
-    def __init__(self, cfg: TrainConfig, device: torch.device, stage: int, course_seed: int):
+    def __init__(self, cfg: TrainConfig, device: torch.device, stage: int, course_seed: int,
+                 rank: int = 0):
         self.cfg = cfg
         self.device = device
+        self.rank = rank  # マルチcollector時の識別。カリキュラム進級判定はrank0のみ
         spec = STAGES[min(stage, len(STAGES) - 1)]
         env_cfg = cfg.env
         env_cfg.stage = spec.course_stage
         env_cfg.color_dr = spec.color_dr
         env_cfg.clutter = spec.clutter
+        # rankごとにRNG系列をずらす(コース形状はcourse_seedで共通、ノイズ/DR/スポーンが分岐)
         self.env = GenesisRaceEnv(env_cfg, num_envs=env_cfg.num_envs, course_seed=course_seed,
-                                  stage=spec.course_stage)
+                                  stage=spec.course_stage,
+                                  rng_seed=course_seed + 100_003 * rank)
         self.curriculum = CurriculumManager(cfg.curriculum, start_stage=stage)
         # collectorはプロセス再起動で作り直されるため、シード連番を現seedから復元する
         # (これがないとnext_course_seedが毎回base+1を返し、同一コースを再構築し続ける)
@@ -73,6 +77,21 @@ class Collector:
         if self.prof.enabled:
             self.env.rig.render = self.prof.wrap("render", self.env.rig.render)
             self.env.scene.step = self.prof.wrap("physics", self.env.scene.step)
+            # env_rest(env.step - render - physics)の内訳
+            self.env.drone.state = self.prof.wrap("e_state", self.env.drone.state)
+            self.env.drone.apply = self.prof.wrap("e_apply", self.env.drone.apply)
+            self.env.imu.tick_analytic = self.prof.wrap("e_imu", self.env.imu.tick_analytic)
+            self.env._build_obs = self.prof.wrap("e_obs", self.env._build_obs)
+            self.env.rewards.compute = self.prof.wrap("e_rew", self.env.rewards.compute)
+            self.env.reset_idx = self.prof.wrap("e_reset", self.env.reset_idx)
+            # e_resetの内訳(r_*はe_resetに内包される)
+            self.env.drone.set_state = self.prof.wrap("r_set_state", self.env.drone.set_state)
+            self.env.drone.reset_idx = self.prof.wrap("r_drone_dr", self.env.drone.reset_idx)
+            self.env._update_ribbon = self.prof.wrap("r_ribbon", self.env._update_ribbon)
+            self.env._update_glow = self.prof.wrap("r_glow", self.env._update_glow)
+            self.env.img_queue.reset_idx = self.prof.wrap("r_imgq", self.env.img_queue.reset_idx)
+            self.env._check_gate_pass = self.prof.wrap("e_gate", self.env._check_gate_pass)
+            self.env._check_collision = self.prof.wrap("e_coll", self.env._check_collision)
 
     # --- 内部 ---
 
@@ -234,7 +253,13 @@ class Collector:
     # --- カリキュラム ---
 
     def maybe_curriculum(self) -> dict | None:
-        """進級 or 再構築が必要なら {'stage':…, 'seed':…} を返す(プロセス再起動を要求)。"""
+        """進級 or 再構築が必要なら {'stage':…, 'seed':…} を返す(プロセス再起動を要求)。
+
+        マルチcollector時はrank0だけが進級/再構築を判定する(他rankは自分の統計で
+        resume_probだけアニールし、rank0の再構築時に一緒に再起動される)。
+        """
+        if self.rank != 0:
+            return None
         advanced = self.curriculum.maybe_advance()
         if advanced or self.curriculum.needs_rebuild():
             seed = self.curriculum.next_course_seed(self.cfg.env.course_seed)

@@ -20,6 +20,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYOPENGL_PLATFORM=egl
+      - LP_NUM_THREADS=8 # llvmpipe(SWレンダ)のスレッド数。320x180にはこれで十分で、28本はsync負けする
     volumes:
       - .:/app
       - ./checkpoints:/app/checkpoints

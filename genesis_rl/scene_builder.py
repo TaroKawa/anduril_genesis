@@ -18,7 +18,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .course import BAR_W, CourseSpec, GATE_DEPTH, GATE_INNER, GATE_OUTER, ribbon_segments
+from .course import (
+    BAR_W,
+    CourseSpec,
+    GATE_DEPTH,
+    GATE_INNER,
+    GATE_OUTER,
+    floor_line_segments,
+)
 
 
 def ned2w(p) -> tuple:
@@ -217,44 +224,47 @@ class SceneBuilder:
                                   fixed=True, collision=False)
                 self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
 
-            # ゲート真下の床の金色グロー(実画像1,2)。
-            # 「次に行くべきゲート」だけ点灯させるため、リボン同様に非固定+重力補償で
-            # per-envに表示/非表示を切り替えられるエンティティにする。
+            # ゲート直前の床の黄色グロー(実映像のゲート手前の黄色い帯)。ゲートの向き
+            # (法線の水平成分)に沿ってレーン状に伸ばし、収束する青ラインの終端＝ゲート
+            # 位置を強調する。「次に行くべきゲート」だけ点灯(リボン同様 非固定+重力補償)。
+            nrm_w = R_w[:, 0]                                  # ゲート法線(world)
+            ang = float(np.degrees(np.arctan2(nrm_w[1], nrm_w[0])))
             glow = scene.add_entity(
-                gs.morphs.Box(pos=(cw[0], cw[1], 0.02), size=(2.2, 2.2, 0.02),
-                              fixed=False, collision=False),
+                gs.morphs.Box(pos=(cw[0], cw[1], 0.02), euler=(0.0, 0.0, ang),
+                              size=(4.0, 0.7, 0.02), fixed=False, collision=False),
                 material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
                 surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
             )
             self.glow_entities.append(glow)
 
     def _add_ribbon(self, scene, gs):
-        """ゲートごとのリボン区間を個別エンティティで追加(動的表示用)。
+        """青パス=床面のシアン・レーンライン(2本)を区間ごとに個別エンティティで追加。
 
-        非固定+gravity_compensation=1.0 でその場に留まり、per-envで
-        set_pos により表示(原点)/非表示(床下-80m)を切り替えられる。
-        self.ribbon_entities[i] = ゲートi+1へ向かう区間。
+        実映像の青パスは空中リボンではなく床のガイドライン(ゲートへ収束する2本)なので、
+        床投影の twin-line メッシュ(course.floor_line_segments)で描画する。空中リボンは
+        実機に存在しない手掛かりになり sim-to-sim を悪化させるため廃止した。
+        非固定+gravity_compensation=1.0 で per-env に set_pos し、表示(原点)/非表示
+        (床下-80m)を切り替える機構(genesis_race_env._update_ribbon)はそのまま流用。
+        self.ribbon_entities[i] = ゲートi+1へ向かう区間(並びは従来と一致)。
         """
         import trimesh
 
         self.ribbon_entities = []
-        for verts_ned, faces in ribbon_segments(self.course, width=1.8):
+        r, g, b = self.colors.ribbon_rgb
+        for verts_ned, faces in floor_line_segments(self.course):
             verts_w = verts_ned.copy()
             verts_w[:, 1] *= -1.0
             verts_w[:, 2] *= -1.0
-            # ribbon_meshはwatertightな角柱を返す(両面化の面複製はwatertight性を
-            # 壊して慣性推定を凸包フォールバックさせるので行わない)
             mesh = trimesh.Trimesh(vertices=verts_w, faces=faces, process=False)
             f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
             mesh.export(f.name)
-            # 半透明+発光(Rough=Plastic系はopacity_texture対応。Emissionは不透明のみ)
-            r, g, b = self.colors.ribbon_rgb
+            # 床ラインは実映像同様に明るく見せる(半透明を薄めて発光を強調)
             ent = scene.add_entity(
                 gs.morphs.Mesh(file=f.name, fixed=False, collision=False,
                                decimate=False, convexify=False),
                 material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                surface=gs.surfaces.Rough(color=(r * 0.3, g * 0.3, b * 0.3),
-                                          emissive=(r, g, b), opacity=0.45),
+                surface=gs.surfaces.Rough(color=(r * 0.2, g * 0.2, b * 0.2),
+                                          emissive=(r, g, b), opacity=0.9),
             )
             self.ribbon_entities.append(ent)
 

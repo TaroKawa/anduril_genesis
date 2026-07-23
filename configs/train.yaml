@@ -1,6 +1,6 @@
 # Phase 1: Genesis 2GPU学習の既定設定。genesis_rl/config.py のdataclassに対応。
 env:
-  num_envs: 128         # レンダ対象は16のまま(vecのゲート観測は幾何検出なので非レンダenvも有効)
+  num_envs: 64          # per collector(collector 2プロセス × 64 = 総計128)
   n_gates: 18
   course_seed: 0
   stage: 0              # カリキュラムが自動進級(curriculum.enabled: true)
@@ -8,6 +8,7 @@ env:
     backend: auto       # batch(Madrona) -> 不可なら sequential へ自動フォールバック
     width: 320
     height: 180
+    max_seq_envs: 8     # per collector(2プロセスで総計16レンダ = 従来同等)
 
 sac:
   batch_size: 1024
@@ -32,8 +33,9 @@ run:
   ckpt_dir: checkpoints
   eval_interval: 250000
   eval_video: true
-  profile: true         # 一時的: collectorステップ内訳の計測(計測後falseに戻す)
+  profile: false        # collectorステップ内訳の計測(sync入りで少し遅くなる。調査時のみtrue)
 
 hw:
   collector_gpu: "3070" # デバイス名の部分一致
   learner_gpu: "4060"
+  num_collectors: 2     # collectorプロセス数(python 1スレッド駆動がボトルネックのため並列化)

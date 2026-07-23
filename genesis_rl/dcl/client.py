@@ -31,6 +31,17 @@ import numpy as np
 MAVLINK_CMD_SIM_RESET = 31000
 ENCAPSULATED_RACE_STATUS_MSG_ID = 1
 COLLISION_ACCEL_MPS2 = 40.0
+# 本番HIGHRES_IMUのgyroは学習側の観測規約(frames.ProductionSigns.gyro_out_sign=-1、
+# Spakona estimatorのgyro_sign=[-1,-1,-1]と同一)に対して符号反転している。生値のまま
+# vecに入れると方策のレート帰還が正帰還になり発進直後から転がる(2026-07-23 実機ログで確定:
+# 指令→gyro応答比が全軸-2.5→-1倍で+2.5=負帰還)。ここで学習規約へ揃える。
+GYRO_OBS_SIGN = (-1.0, -1.0, -1.0)
+ACCEL_OBS_SIGN = (1.0, 1.0, 1.0)   # accelは整合(実機ログで level rest≈(0,0,-9.81)を確認)
+# 実シムのレートループは指令の約2.5倍の角速度を出す(Genesisは指令=達成レート≈1倍で学習)。
+# 開ループ同定(runs/sysid_0723_0321, --sysid)で roll/pitch/yaw = 2.47/2.51/2.19 を実測。
+# デプロイ側で送信レートをこのゲインで割り、達成レートを方策の意図値=Genesis規約へ揃える
+# (リトレ不要。恒久対策はconfig.py drone.k_rate/アクションスケールの較正+再学習)。
+RATE_CMD_GAIN = (2.47, 2.51, 2.19)
 HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(フェイルセーフ用)
 CONTROL_HZ = 250.0             # コマンド送信レート(シム仕様)
 VIDEO_W, VIDEO_H = 640, 360
@@ -166,7 +177,7 @@ class MavlinkIO:
 
 # ---------------------------------------------------------------- 映像 + ゲート検出
 
-def gate_detect_hsv(img_bgr: np.ndarray) -> dict:
+def gate_detect_hsv(img_bgr: np.ndarray, gate_area_max: float | None = None) -> dict:
     """HSVオレンジ抽出でゲートbboxを検出(YOLOX代替、Spakona gate_color.py移植)。
 
     最大連結成分のbboxを使う(通常は最も近い=アクティブゲート)。
@@ -191,7 +202,8 @@ def gate_detect_hsv(img_bgr: np.ndarray) -> dict:
     cx, cy = centroids[i]
     H, W = img_bgr.shape[:2]
     from ..contracts import GATE_AREA_MAX
-    rel = float(np.clip(1.0 - (w * h) / GATE_AREA_MAX, 0.0, 1.0))
+    gam = GATE_AREA_MAX if gate_area_max is None else gate_area_max
+    rel = float(np.clip(1.0 - (w * h) / gam, 0.0, 1.0))
     return {"visible": 1, "center": (float(cx / W), float(cy / H)), "rel_dist": rel}
 
 
@@ -297,6 +309,49 @@ class VideoRX:
 
 # ---------------------------------------------------------------- パイロット
 
+class ScriptedRatePilot:
+    """方策を使わず既知のレート指令列を送る開ループ同定用パイロット。
+
+    プラント(実シムのレート追従)のゲインと符号を方策から切り離して測るためのもの。
+    一定推力(既定 hover 少し上)を保ちつつ、1軸ずつ±のレートステップを与える。
+    analyze_flight の「指令→gyro応答比」がそのまま真のプラントゲイン+符号になる。
+    """
+
+    def __init__(self, thrust: float = 0.30):
+        from .. import contracts as C
+
+        self.C = C
+        self.thrust = float(thrust)
+        self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)  # 記録用(方策なしなので0)
+        self.last_vec = np.zeros(C.VEC_DIM, dtype=np.float32)
+        self.t0 = None
+        r, p, y = 0.3, 0.3, 0.1   # ステップ振幅(RATE_LIMITS内)
+        # (継続秒, roll, pitch, yaw)
+        self.schedule = [
+            (1.5, 0, 0, 0),
+            (1.0, +r, 0, 0), (1.0, 0, 0, 0), (1.0, -r, 0, 0), (1.0, 0, 0, 0),
+            (1.0, 0, +p, 0), (1.0, 0, 0, 0), (1.0, 0, -p, 0), (1.0, 0, 0, 0),
+            (1.0, 0, 0, +y), (1.0, 0, 0, 0), (1.0, 0, 0, -y), (1.0, 0, 0, 0),
+        ]
+        self.total = sum(s[0] for s in self.schedule)
+
+    def reset(self):
+        self.t0 = None
+
+    def decide(self, shared: dict, warmup: bool = False):
+        if self.t0 is None:
+            self.t0 = time.time()
+        el = (time.time() - self.t0) % self.total   # ループ再生
+        acc = 0.0
+        seg = self.schedule[-1]
+        for s in self.schedule:
+            acc += s[0]
+            if el < acc:
+                seg = s
+                break
+        return float(seg[1]), float(seg[2]), float(seg[3]), self.thrust
+
+
 class GenesisPilot:
     """学習方策(新旧構造自動判別)で観測→物理コマンドを計算する。"""
 
@@ -312,6 +367,7 @@ class GenesisPilot:
         self.policy = LoadedPolicy(ckpt_path, self.device, num_envs=1)
         self.action_map = C.ActionMap()
         self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)
+        self.last_vec = np.zeros(C.VEC_DIM, dtype=np.float32)   # 記録用: 直近に方策へ渡したvec
         self._reset_flag = torch.zeros(1, dtype=torch.bool, device=self.device)
         # CUDA初期化を離陸前に済ませる(初回推論の~100msスパイク回避)
         for _ in range(10):
@@ -327,8 +383,10 @@ class GenesisPilot:
         C = self.C
         vec = np.zeros(C.VEC_DIM, dtype=np.float32)
         imu = shared.get("imu") or {}
-        vec[C.VEC_GYRO] = np.asarray(imu.get("gyro", (0.0, 0.0, 0.0)), np.float32) / C.RATE_SCALE
-        vec[C.VEC_ACCEL] = np.asarray(imu.get("accel", (0.0, 0.0, -9.81)), np.float32) / C.ACCEL_SCALE
+        gyro = np.asarray(imu.get("gyro", (0.0, 0.0, 0.0)), np.float32) * np.asarray(GYRO_OBS_SIGN, np.float32)
+        accel = np.asarray(imu.get("accel", (0.0, 0.0, -9.81)), np.float32) * np.asarray(ACCEL_OBS_SIGN, np.float32)
+        vec[C.VEC_GYRO] = gyro / C.RATE_SCALE
+        vec[C.VEC_ACCEL] = accel / C.ACCEL_SCALE
         og = shared.get("obs_gate") or {}
         age_s = now - float(og.get("t_wall", 0.0))
         visible = bool(og.get("visible", 0)) and age_s <= C.GATE_OBS_MAX_AGE_S
@@ -339,7 +397,12 @@ class GenesisPilot:
                                np.clip(age_s / C.GATE_OBS_MAX_AGE_S, 0.0, 1.0))
         else:
             vec[C.VEC_GATE] = (0.0, 0.0, 0.0, 1.0, 1.0)
-        passed = int((shared.get("race") or {}).get("active_gate_index", 0))
+        # Genesis規約(genesis_race_env.py: onehot[max(active_gate-1,0)])に合わせる。
+        # DCLのactive_gate_indexはGenesisのactive_gateと同義(狙うゲートの0始まりindex、
+        # ゲート通過でインクリメント)。生値をそのまま使うと2本目以降で+1ズレる
+        # (runs/sysid_0723_0321でgate0→1遷移を確認しoff-by-one確定)。
+        agi = int((shared.get("race") or {}).get("active_gate_index", 0))
+        passed = max(agi - 1, 0)
         if 0 <= passed < C.MAX_GATES:
             vec[C.VEC_ONEHOT.start + passed] = 1.0
         vec[C.VEC_LAST_ACTION] = self.last_action
@@ -353,14 +416,18 @@ class GenesisPilot:
         if rgb is None:
             rgb = np.zeros((224, 224, 3), np.uint8)
         rgb_t = torch.as_tensor(np.ascontiguousarray(rgb)).unsqueeze(0).to(self.device)
-        vec_t = torch.as_tensor(self._build_vec(shared, now)).unsqueeze(0).to(self.device)
+        vec = self._build_vec(shared, now)
+        vec_t = torch.as_tensor(vec).unsqueeze(0).to(self.device)
         with torch.no_grad():
             a = self.policy.act(rgb_t, vec_t, self._reset_flag)
         self._reset_flag[:] = False
         if not warmup:
             self.last_action = a[0].cpu().numpy().astype(np.float32)
+            self.last_vec = vec
         cmd = self.action_map.to_command(a)[0].cpu().numpy()
-        return float(cmd[0]), float(cmd[1]), float(cmd[2]), float(cmd[3])
+        # 実シムのレート過剰応答(≈2.5倍)を打ち消し、達成レートを方策の意図値へ揃える
+        g = np.asarray(RATE_CMD_GAIN, np.float32)
+        return float(cmd[0] / g[0]), float(cmd[1] / g[1]), float(cmd[2] / g[2]), float(cmd[3])
 
 
 # ---------------------------------------------------------------- Windowsリレー
@@ -400,32 +467,36 @@ def spawn_win_relay(mavlink_port: int, video_port: int):
 DEFAULT_YOLOX_CKPT = "YOLOX_outputs_x/yolox_x_custom/best_ckpt.pth"
 
 
-def make_gate_detector(kind: str, yolox_ckpt: str):
+def make_gate_detector(kind: str, yolox_ckpt: str, gate_area_max: float | None = None):
     """ゲート検出関数 detect(img_bgr)->dict を返す。
 
     kind="yolox": YOLOX-x を GPU/CPU にロード。重みが無い/初期化失敗時は
     警告して HSV にフォールバックする(飛行自体は止めない)。
     kind="hsv":   従来の HSV 色検出。
+    gate_area_max: rel_dist正規化のoverride(実bbox較正用。Noneで契約既定150000)。
     """
+    import functools
+
+    hsv = functools.partial(gate_detect_hsv, gate_area_max=gate_area_max)
     if kind == "hsv":
-        return gate_detect_hsv
+        return hsv
 
     import os
 
     if not os.path.exists(yolox_ckpt):
         print(f"WARNING: YOLOX重みが見つかりません ({yolox_ckpt}) → HSV検出にフォールバック",
               flush=True)
-        return gate_detect_hsv
+        return hsv
     try:
         import torch
 
         from .yolox_gate import GateYOLOX
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return GateYOLOX(yolox_ckpt, dev).detect
+        return GateYOLOX(yolox_ckpt, dev, gate_area_max=gate_area_max).detect
     except Exception as e:
         print(f"WARNING: YOLOX初期化に失敗 ({type(e).__name__}: {e}) → HSV検出にフォールバック",
               flush=True)
-        return gate_detect_hsv
+        return hsv
 
 
 # ---------------------------------------------------------------- メインループ
@@ -434,7 +505,9 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         video_port=5600, out_mp4: str | None = "flight_dcl.mp4",
         max_sec: float = 0.0, reset_on_collision: bool = True,
         relay: bool = True, gate_detector: str = "yolox",
-        yolox_ckpt: str = DEFAULT_YOLOX_CKPT) -> None:
+        yolox_ckpt: str = DEFAULT_YOLOX_CKPT,
+        record_dir: str | None = None, sysid: bool = False,
+        gate_area_max: float | None = None) -> None:
     import signal
 
     from .. import contracts as C
@@ -449,8 +522,18 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     shared: dict = {}
-    pilot = GenesisPilot(ckpt)               # 重いロードを接続前に済ませる(後始末不要フェーズ)
-    gate_fn = make_gate_detector(gate_detector, yolox_ckpt)  # YOLOX/HSV も接続前にロード
+    if sysid:
+        pilot = ScriptedRatePilot()          # 方策を外した開ループ・レート同定
+        print("SYSID mode: 方策なし・既知レートステップを送出します", flush=True)
+    else:
+        pilot = GenesisPilot(ckpt)           # 重いロードを接続前に済ませる(後始末不要フェーズ)
+    gate_fn = make_gate_detector(gate_detector, yolox_ckpt, gate_area_max)  # YOLOX/HSV も接続前にロード
+    recorder = None
+    if record_dir:
+        from .recorder import FlightRecorder
+        recorder = FlightRecorder(record_dir, meta={
+            "ckpt": ckpt, "contract_hash": C.contract_hash(),
+            "gate_detector": gate_detector, "policy_hz": C.POLICY_HZ})
     relay_proc = None
     mav = None
     video = None
@@ -509,6 +592,13 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
                 next_policy_t = max(next_policy_t + 1.0 / C.POLICY_HZ, now)
                 cmd = pilot.decide(shared)
                 shared["last_cmd"] = cmd
+                if recorder is not None:
+                    col = shared.get("collision")
+                    recorder.record(
+                        rgb224=(shared.get("obs_rgb") or {}).get("rgb"),
+                        vec=pilot.last_vec, raw_action=pilot.last_action, cmd=cmd,
+                        shared=shared,
+                        collision=bool(col and not col.get("handled")))
             if not flying:
                 cmd = (0.0, 0.0, 0.0, HOVER_THRUST)  # ピン中/待機はフェイルセーフ
 
@@ -570,4 +660,9 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
                     relay_proc.kill()
                 except Exception:
                     pass
+        if recorder is not None:
+            try:
+                recorder.close()
+            except Exception as e:
+                print(f"(cleanup) recorder close failed: {e}", flush=True)
         print("DCL client exited.", flush=True)

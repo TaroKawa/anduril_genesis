@@ -64,7 +64,9 @@ class StepProfiler:
             return
         per = {k: v / self.steps * 1000.0 for k, v in self.acc.items()}
         env = per.get("env_step", 0.0)
-        inner = per.get("render", 0.0) + per.get("physics", 0.0)
+        # env_step内で計測される入れ子セクション(render/physics/e_*)を差し引いた残り
+        inner = sum(v for k, v in per.items()
+                    if k in ("render", "physics") or k.startswith("e_"))
         per["env_rest"] = env - inner
         per.pop("env_step", None)
         total_ms = wall / self.steps * 1000.0

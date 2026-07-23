@@ -299,6 +299,38 @@ def ribbon_segments(spec: CourseSpec, width: float = 1.8) -> list[tuple[np.ndarr
     return segs
 
 
+def floor_line_segments(spec: CourseSpec, lane_half: float = 0.9, line_w: float = 0.18,
+                        thickness: float = 0.06, floor_d: float = -0.05
+                        ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """本番シム同様の「床の上のシアン・レーンライン(2本)」を区間ごとに返す。
+
+    実映像の青パスは空中リボンではなく、床面をゲートへ収束する2本の発光ラインなので、
+    ribbon_segments(空中バンド)の置き換えとして使う。表示窓/明滅の制御は
+    genesis_race_env の ribbon_entities(区間1エンティティ)機構をそのまま流用できるよう、
+    左右2本を1メッシュに結合して返す(区間数・並びは ribbon_segments と一致)。
+
+    区間の中心線を床へ投影(NED d=floor_d)し、水平接線の左右に ±lane_half だけずらした
+    2本を各々薄い角柱(watertight)にして結合する。
+    """
+    per = RIBBON_SAMPLES_PER_SEG
+    segs = []
+    for i in range(1, spec.n_gates):
+        lo = per * (i - 1)
+        hi = min(per * i + 1, len(spec.ribbon_pts))
+        pts = spec.ribbon_pts[lo:hi].astype(float).copy()
+        pts[:, 2] = floor_d                                  # 床へ投影
+        t = np.gradient(pts, axis=0)
+        t[:, 2] = 0.0                                        # 水平接線
+        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+        side = np.stack([-t[:, 1], t[:, 0], np.zeros(len(t))], axis=1)  # 水平90°
+        vL, fL = ribbon_mesh(pts + side * lane_half, width=line_w, thickness=thickness)
+        vR, fR = ribbon_mesh(pts - side * lane_half, width=line_w, thickness=thickness)
+        verts = np.vstack([vL, vR])
+        faces = np.vstack([np.asarray(fL), np.asarray(fR) + len(vL)])
+        segs.append((verts, faces))
+    return segs
+
+
 def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8,
                 thickness: float = 0.03) -> tuple[np.ndarray, np.ndarray]:
     """リボン(発光ガイドパス)の薄い角柱メッシュを生成。NED座標のまま返す。
