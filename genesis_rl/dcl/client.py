@@ -37,11 +37,12 @@ COLLISION_ACCEL_MPS2 = 40.0
 # 指令→gyro応答比が全軸-2.5→-1倍で+2.5=負帰還)。ここで学習規約へ揃える。
 GYRO_OBS_SIGN = (-1.0, -1.0, -1.0)
 ACCEL_OBS_SIGN = (1.0, 1.0, 1.0)   # accelは整合(実機ログで level rest≈(0,0,-9.81)を確認)
-# 実シムのレートループは指令の約2.5倍の角速度を出す(Genesisは指令=達成レート≈1倍で学習)。
-# 開ループ同定(runs/sysid_0723_0321, --sysid)で roll/pitch/yaw = 2.47/2.51/2.19 を実測。
-# デプロイ側で送信レートをこのゲインで割り、達成レートを方策の意図値=Genesis規約へ揃える
-# (リトレ不要。恒久対策はconfig.py drone.k_rate/アクションスケールの較正+再学習)。
-RATE_CMD_GAIN = (2.47, 2.51, 2.19)
+# 実シムのレートループは指令の約2.5倍の角速度を出す(振幅0.02〜0.4で線形、sysid v2で確定:
+# runs/sysid2_rate_0723 / sysid2_yaw_0723)。旧ckpt(Genesisが指令=達成レート≈1倍のプラント
+# で学習)はデプロイ側で送信レートをこのゲインで割って達成レートを方策の意図値へ揃える。
+# 新ckpt(config.py drone.cmd_gainでプラントごと模擬して学習)は除算不要 —
+# GenesisPilotがckptのcfgスナップショットから自動判別する。
+RATE_CMD_GAIN = (2.44, 2.46, 2.18)
 HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(フェイルセーフ用)
 CONTROL_HZ = 250.0             # コマンド送信レート(シム仕様)
 VIDEO_W, VIDEO_H = 640, 360
@@ -97,6 +98,10 @@ class MavlinkIO:
         accel = (msg.xacc, msg.yacc, msg.zacc)
         gyro = (msg.xgyro, msg.ygyro, msg.zgyro)
         self.shared["imu"] = {"accel": accel, "gyro": gyro, "t": msg.time_usec * 1e-6}
+        log = self.shared.get("imu_log")
+        if log is not None:   # 高レートIMUログ(sysid解析用。dequeはGILでスレッド安全)
+            log.append({"t_rx_wall": time.time(), "t_sim": msg.time_usec * 1e-6,
+                        "gyro": gyro, "accel": accel})
         race = self.shared.get("race") or {}
         # 発進グレース: ピン解除直後は拘束反力の残り(~17g)が乗るため衝突判定しない
         released_at = race.get("released_at")
@@ -310,46 +315,126 @@ class VideoRX:
 # ---------------------------------------------------------------- パイロット
 
 class ScriptedRatePilot:
-    """方策を使わず既知のレート指令列を送る開ループ同定用パイロット。
+    """方策を使わず既知の指令列を送る開ループ同定用パイロット(sysid v2)。
 
-    プラント(実シムのレート追従)のゲインと符号を方策から切り離して測るためのもの。
-    一定推力(既定 hover 少し上)を保ちつつ、1軸ずつ±のレートステップを与える。
-    analyze_flight の「指令→gyro応答比」がそのまま真のプラントゲイン+符号になる。
+    プラント(実シムの動力学)を方策から切り離して測る。schedule要素は
+    (継続秒, roll, pitch, yaw, thrust)。prefixを1回再生後、loopを繰り返す。
+    解析は scripts/analyze_sysid.py(--record-dir の steps.jsonl + imu.jsonl)。
+
+    プラン:
+      rate:   3軸×複数振幅の対称レートパルス → ゲインの線形性/飽和・時定数・遅延
+      yaw:    yaw微小振幅の掃引 → 不感帯/小信号ゲインの解像(rateプランで非線形を確認済み)
+      thrust: 推力階段(上昇/下降の対称ペアでv_z蓄積を抑制)→ 比力曲線 A(thrust)
+      drag:   前傾のまま加速→水平化→惰性減速 → 線形ドラッグ c(体x比力の指数減衰)
+
+    幾何の前提(パルス設計にのみ使用、同定結果には影響しない):
+      実測レートゲイン≈2.5(runs/sysid_0723_0321)、スポーン前傾-17.8°。
+      水平化(機首上げ)は pitch=+0.1 を 1.24s(≈17.8°)。
+      ※DCL実機で確認済み(runs/sysid_rate_0723): pitch指令-0.1では前傾が深くなり
+        前進加速が継続する(体x比力が単調増加)→ 機首上げは+側。
     """
 
-    def __init__(self, thrust: float = 0.30):
+    HOVER = 0.2742          # contracts.HOVER_THRUST(A=g想定)
+    TILT_HOVER = 0.281      # 17.8°前傾時に鉛直成分がgになる推力(=hover/√cos17.8°)
+    LEVEL = (1.24, 0.0, +0.1, 0.0, 0.281)   # 前傾-17.8°→水平(達成レート≈0.25rad/s)
+
+    def __init__(self, plan: str = "rate"):
         from .. import contracts as C
 
         self.C = C
-        self.thrust = float(thrust)
+        self.plan = plan
         self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)  # 記録用(方策なしなので0)
         self.last_vec = np.zeros(C.VEC_DIM, dtype=np.float32)
         self.t0 = None
-        r, p, y = 0.3, 0.3, 0.1   # ステップ振幅(RATE_LIMITS内)
-        # (継続秒, roll, pitch, yaw)
-        self.schedule = [
-            (1.5, 0, 0, 0),
-            (1.0, +r, 0, 0), (1.0, 0, 0, 0), (1.0, -r, 0, 0), (1.0, 0, 0, 0),
-            (1.0, 0, +p, 0), (1.0, 0, 0, 0), (1.0, 0, -p, 0), (1.0, 0, 0, 0),
-            (1.0, 0, 0, +y), (1.0, 0, 0, 0), (1.0, 0, 0, -y), (1.0, 0, 0, 0),
-        ]
-        self.total = sum(s[0] for s in self.schedule)
+        h = self.HOVER
+        climb = (1.0, 0.0, 0.0, 0.0, 0.29)      # 高度マージン確保(+1m弱)
+
+        if plan == "rate":
+            self.prefix = [climb, self.LEVEL, (0.7, 0, 0, 0, h)]
+            body = []
+            # 振幅を上げるほどパルスを短く(大バンクからの復帰を安全に)。
+            # 振幅を外側ループに: 途中で墜落しても全軸の小振幅データが先に揃う。
+            amps = [(0.05, 0.8), (0.1, 0.8), (0.2, 0.6), (0.4, 0.4)]
+            for amp, dur in amps:
+                for ax in range(3):
+                    for sgn in (+1.0, -1.0):
+                        rpy = [0.0, 0.0, 0.0]
+                        rpy[ax] = sgn * amp
+                        body.append((dur, *rpy, h))
+                        body.append((0.5, 0.0, 0.0, 0.0, h))
+            self.loop = body
+        elif plan == "roll":
+            # roll物理方向の判定: バンク~10°を2.5s保持 → 横比力 f_y = -c·v_y の符号が
+            # バンク方向を示す(+rollでf_y<0なら「+指令=右バンク」)。左右対称に実施。
+            self.prefix = [climb, self.LEVEL, (0.7, 0, 0, 0, h)]
+            th = 0.277   # 10°バンク時の高度維持推力
+            self.loop = [
+                (0.9, +0.08, 0.0, 0.0, h), (2.5, 0.0, 0.0, 0.0, th),
+                (0.9, -0.08, 0.0, 0.0, h), (1.5, 0.0, 0.0, 0.0, h),
+                (0.9, -0.08, 0.0, 0.0, h), (2.5, 0.0, 0.0, 0.0, th),
+                (0.9, +0.08, 0.0, 0.0, h), (1.5, 0.0, 0.0, 0.0, h),
+            ]
+        elif plan == "yaw":
+            self.prefix = [climb, self.LEVEL, (0.7, 0, 0, 0, h)]
+            body = []
+            for amp in (0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.25, 0.40):
+                for sgn in (+1.0, -1.0):
+                    body.append((0.9, 0.0, 0.0, sgn * amp, h))
+                    body.append((0.4, 0.0, 0.0, 0.0, h))
+            self.loop = body
+        elif plan == "thrust":
+            self.prefix = [climb, self.LEVEL, (0.7, 0, 0, 0, h)]
+            # (上げ, 対称の下げ)ペア: 下げ側は実測曲線 A≈g*(t/0.269)^1.64 で净v_z≈0に
+            # なるよう選定(初回計測 runs/sysid2_thrust_0723 のフィット)。想定が外れても
+            # ドリフトするだけで、解析側はv_z推定で補正する。方策レンジ[0.265,0.40]重視。
+            pairs = [(0.30, 0.235), (0.32, 0.211), (0.34, 0.183), (0.37, 0.132),
+                     (0.25, 0.297), (0.26, 0.288)]
+            body = [(0.8, 0.0, 0.0, 0.0, h)]
+            for up, dn in pairs:
+                body += [(0.6, 0.0, 0.0, 0.0, up), (0.6, 0.0, 0.0, 0.0, dn),
+                         (0.7, 0.0, 0.0, 0.0, h)]
+            body += [(0.5, 0.0, 0.0, 0.0, 0.40), (0.55, 0.0, 0.0, 0.0, 0.12),
+                     (0.7, 0.0, 0.0, 0.0, h)]
+            self.loop = body
+        elif plan == "drag":
+            # スポーンの前傾-17.8°をそのまま加速に使う(prefixで水平化しない)
+            self.prefix = [climb]
+            self.loop = [
+                (3.5, 0.0, 0.0, 0.0, self.TILT_HOVER),    # 前傾加速(→準終端速度)
+                self.LEVEL,                                # 水平化
+                (5.0, 0.0, 0.0, 0.0, h),                   # 惰性減速: f_x∝e^{-ct}
+                (1.24, 0.0, -0.1, 0.0, 0.281),             # 前傾に戻す(ループ整合)
+            ]
+        else:
+            raise ValueError(f"unknown sysid plan: {plan}")
+        self.prefix_total = sum(s[0] for s in self.prefix)
+        self.loop_total = sum(s[0] for s in self.loop)
+        print(f"SYSID plan={plan}: prefix {self.prefix_total:.1f}s + "
+              f"loop {self.loop_total:.1f}s", flush=True)
 
     def reset(self):
         self.t0 = None
 
-    def decide(self, shared: dict, warmup: bool = False):
-        if self.t0 is None:
-            self.t0 = time.time()
-        el = (time.time() - self.t0) % self.total   # ループ再生
+    def cmd_at(self, elapsed: float) -> tuple[float, float, float, float]:
+        """経過秒→コマンド(壁時計にもシム時間にも使える。Genesis側の再生検証と共用)。"""
+        if elapsed < self.prefix_total:
+            sched, el = self.prefix, elapsed
+        else:
+            sched = self.loop
+            el = (elapsed - self.prefix_total) % self.loop_total   # loopは繰り返し再生
         acc = 0.0
-        seg = self.schedule[-1]
-        for s in self.schedule:
+        seg = sched[-1]
+        for s in sched:
             acc += s[0]
             if el < acc:
                 seg = s
                 break
-        return float(seg[1]), float(seg[2]), float(seg[3]), self.thrust
+        return float(seg[1]), float(seg[2]), float(seg[3]), float(seg[4])
+
+    def decide(self, shared: dict, warmup: bool = False):
+        if self.t0 is None:
+            self.t0 = time.time()
+        return self.cmd_at(time.time() - self.t0)
 
 
 class GenesisPilot:
@@ -366,6 +451,17 @@ class GenesisPilot:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy = LoadedPolicy(ckpt_path, self.device, num_envs=1)
         self.action_map = C.ActionMap()
+        # レートゲイン除算の自動判別: 学習時にプラントゲイン(drone.cmd_gain>1)を模擬した
+        # ckptは方策の指令がそのまま実シム規約 → 除算しない。旧ckpt(cfg欠落 or gain≈1)は
+        # RATE_CMD_GAIN で割って達成レートを意図値へ揃える。
+        try:
+            cg = self.policy.cfg_snapshot["env"]["drone"]["cmd_gain"]
+            modeled = max(cg) > 1.01
+        except (KeyError, TypeError, ValueError):
+            modeled = False
+        self.rate_div = np.ones(3, np.float32) if modeled else np.asarray(RATE_CMD_GAIN, np.float32)
+        print(f"GenesisPilot: plant cmd_gain {'modeled in training → no divide' if modeled else 'not modeled → divide by RATE_CMD_GAIN'}",
+              flush=True)
         self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)
         self.last_vec = np.zeros(C.VEC_DIM, dtype=np.float32)   # 記録用: 直近に方策へ渡したvec
         self._reset_flag = torch.zeros(1, dtype=torch.bool, device=self.device)
@@ -425,8 +521,8 @@ class GenesisPilot:
             self.last_action = a[0].cpu().numpy().astype(np.float32)
             self.last_vec = vec
         cmd = self.action_map.to_command(a)[0].cpu().numpy()
-        # 実シムのレート過剰応答(≈2.5倍)を打ち消し、達成レートを方策の意図値へ揃える
-        g = np.asarray(RATE_CMD_GAIN, np.float32)
+        # 旧ckptのみ: 実シムのレート過剰応答(≈2.5倍)を打ち消す(新ckptはrate_div=1)
+        g = self.rate_div
         return float(cmd[0] / g[0]), float(cmd[1] / g[1]), float(cmd[2] / g[2]), float(cmd[3])
 
 
@@ -507,7 +603,9 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         relay: bool = True, gate_detector: str = "yolox",
         yolox_ckpt: str = DEFAULT_YOLOX_CKPT,
         record_dir: str | None = None, sysid: bool = False,
+        sysid_plan: str = "rate",
         gate_area_max: float | None = None) -> None:
+    import collections
     import signal
 
     from .. import contracts as C
@@ -523,8 +621,8 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
 
     shared: dict = {}
     if sysid:
-        pilot = ScriptedRatePilot()          # 方策を外した開ループ・レート同定
-        print("SYSID mode: 方策なし・既知レートステップを送出します", flush=True)
+        pilot = ScriptedRatePilot(plan=sysid_plan)   # 方策を外した開ループ同定
+        print("SYSID mode: 方策なし・既知コマンド列を送出します", flush=True)
     else:
         pilot = GenesisPilot(ckpt)           # 重いロードを接続前に済ませる(後始末不要フェーズ)
     gate_fn = make_gate_detector(gate_detector, yolox_ckpt, gate_area_max)  # YOLOX/HSV も接続前にロード
@@ -533,7 +631,9 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         from .recorder import FlightRecorder
         recorder = FlightRecorder(record_dir, meta={
             "ckpt": ckpt, "contract_hash": C.contract_hash(),
-            "gate_detector": gate_detector, "policy_hz": C.POLICY_HZ})
+            "gate_detector": gate_detector, "policy_hz": C.POLICY_HZ,
+            "sysid": sysid, "sysid_plan": sysid_plan if sysid else None})
+        shared["imu_log"] = collections.deque(maxlen=200_000)  # rxスレッドが積む
     relay_proc = None
     mav = None
     video = None
@@ -606,9 +706,18 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
                 next_tx_t = max(next_tx_t + 1.0 / CONTROL_HZ, now)
                 mav.send_rates(*cmd)
 
+            if recorder is not None:                 # 高レートIMUを逐次書き出し
+                q = shared.get("imu_log")
+                while q:
+                    recorder.record_imu(q.popleft())
+
             col = shared.get("collision")
             if col and not col.get("handled"):
                 col["handled"] = True
+                # steps.jsonl(30Hz)は同一イテレーション内のpopで衝突を見逃すため、
+                # イベントとして時刻を独立に残す(analyze_sysidのデータ除外に使う)
+                if recorder is not None:
+                    recorder.record_event({"type": "collision", "t_wall": col["t_wall"]})
                 if reset_on_collision:
                     print("COLLISION -> reset & re-arm", flush=True)
                     reset_sim_and_wait(" (collision)")

@@ -59,13 +59,14 @@ def main():
     cfg.render = RenderConfig(backend="sequential", width=320, height=180)
     # プレビューは公称ダイナミクス・ノイズ控えめで見やすく
     cfg.drone.dr_mass = cfg.drone.dr_k_rate = cfg.drone.dr_drag = cfg.drone.dr_hover = cfg.drone.dr_inertia = (1.0, 1.0)
+    cfg.drone.dr_cmd_gain = cfg.drone.dr_thrust_alpha = (1.0, 1.0)
     cfg.sensors.noise_scale = 0.3
     cfg.sensors.act_delay_jitter = 0
     cfg.no_gate_timeout_s = 12.0  # プレビューはゆっくり飛ぶのでタイムアウトを緩める
     cfg.max_episode_s = 300.0     # 完走(~70s)がエピソード上限60sで切られないように
 
     env = GenesisRaceEnv(cfg, num_envs=1, extra_cameras=True)
-    pilot = ScriptedPilot(env.course, env.device, v_des=args.v_des)
+    pilot = ScriptedPilot(env.course, env.device, v_des=args.v_des, drone_cfg=cfg.drone)
     env.reset_idx(env._all_idx)
 
     # コースレポート

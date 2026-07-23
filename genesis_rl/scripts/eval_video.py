@@ -57,6 +57,7 @@ class LoadedPolicy:
         self.C = C
         self.device = device
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        self.cfg_snapshot = payload.get("cfg") or {}  # 学習時設定(dcl/client.pyのゲイン自動判別に使う)
         sd = payload["agent"]["actor"]
         self.legacy = not any(k.startswith("trunk.") for k in sd)
         if self.legacy:

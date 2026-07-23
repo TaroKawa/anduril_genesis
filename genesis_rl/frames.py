@@ -4,9 +4,13 @@
   NED (n,e,d) <-> Genesis world (x,y,z):  n=x, e=-y, d=-z   (x軸まわり180°の固有回転)
   Body FRD    <-> Genesis body FLU:       f=x, r=-y, d=-z
 
-本番シムの癖(Spakona config.yaml L370-470 の実測sysid)はインターフェース2箇所のみに適用:
-  - cmd_rate_sign: 指令レートの符号(+pitch_rate指令→前傾が実測verified)
-  - gyro_out_sign: ジャイロ観測の符号(3軸全反転が実測verified)
+本番シムの癖はインターフェース2箇所のみに適用(値はconfig.EnvConfig.signs_*):
+  - cmd_rate_sign: 指令レート→内部FRDレート目標の符号
+  - gyro_out_sign: 内部FRD角速度→観測(学習vec)の符号
+2026-07-23のDCL実機軸別同定(runs/sysid2_*)で (+1,+1,-1)/(+1,+1,-1) が確定:
+  +roll指令=右バンク、+pitch指令=機首上げ(※Spakonaドキュメントの「+pitch→前傾」は
+  実機と逆)、+yaw指令=機首左。生gyroは(-ω,-ω,+ω)で、deploy側(client.py)の
+  GYRO_OBS_SIGN=-1⊙生 と gyro_out_sign⊙ω が一致する。
 accelは標準FRD(ピッチ-17.8°ピン時の実測 (-3.0, 0, -9.34) = -R^T g と一致)。
 
 クォータニオンは全て wxyz 順(Genesis / MAVLink と同じ)。

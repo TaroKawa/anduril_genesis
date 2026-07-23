@@ -72,12 +72,16 @@ class Learner:
         return {k: v.detach().cpu() for k, v in self.agent.actor.state_dict().items()}
 
     def maybe_checkpoint(self, ep_stats: dict | None = None, force: bool = False):
+        import dataclasses
+
         cfg = self.cfg
         now = time.time()
         ckpt_dir = Path(cfg.run.ckpt_dir)
+        # 学習時設定を残す(dcl/client.pyがdrone.cmd_gain模擬の有無をここから自動判別する)
+        snap = dataclasses.asdict(cfg)
         if force or now - self._last_ckpt > cfg.run.ckpt_interval_s:
             save_checkpoint(ckpt_dir / "latest.pt", self.agent, learner_step=self.updates,
-                            env_transitions=self.transitions, stage=self.stage)
+                            env_transitions=self.transitions, stage=self.stage, cfg_snapshot=snap)
             self.logger.save_plot()
             self._last_ckpt = now
         if ep_stats:
@@ -86,11 +90,11 @@ class Learner:
             if g > self.best_gates:
                 self.best_gates = g
                 save_checkpoint(ckpt_dir / "best_gates.pt", self.agent, learner_step=self.updates,
-                                env_transitions=self.transitions, stage=self.stage)
+                                env_transitions=self.transitions, stage=self.stage, cfg_snapshot=snap)
             if r > self.best_return:
                 self.best_return = r
                 save_checkpoint(ckpt_dir / "best_return.pt", self.agent, learner_step=self.updates,
-                                env_transitions=self.transitions, stage=self.stage)
+                                env_transitions=self.transitions, stage=self.stage, cfg_snapshot=snap)
 
     def update_success_ratio(self, stage: int):
         # Stage3以降(フルコースを安定通過)は成功バッファ依存を下げる

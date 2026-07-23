@@ -54,6 +54,9 @@ class FlightRecorder:
         os.makedirs(self.frames_dir, exist_ok=True)
         self.save_frames = save_frames
         self._f = open(os.path.join(out_dir, "steps.jsonl"), "w", buffering=1)  # 行バッファ
+        # 高レートIMUログ(HIGHRES_IMU受信ごと。steps.jsonlの30Hzでは時定数/遅延が測れない)
+        self._fimu = open(os.path.join(out_dir, "imu.jsonl"), "w", buffering=1)
+        self.imu_samples = 0
         self.step = 0
         self.t0 = time.time()
         m = {"t_start_wall": self.t0, "save_frames": save_frames}
@@ -106,9 +109,29 @@ class FlightRecorder:
         self._f.write(json.dumps(rec) + "\n")
         self.step += 1
 
+    def record_event(self, ev: dict):
+        """非同期イベント(衝突等)を events.jsonl へ。steps.jsonl の30Hzでは取り漏れるもの。"""
+        if not hasattr(self, "_fev"):
+            self._fev = open(os.path.join(self.dir, "events.jsonl"), "w", buffering=1)
+        self._fev.write(json.dumps(ev) + "\n")
+
+    def record_imu(self, sample: dict):
+        """HIGHRES_IMU 1サンプルを imu.jsonl へ。
+        {t_rx_wall, t_sim, gyro[3], accel[3]}(生値・符号は本番規約のまま)。"""
+        self._fimu.write(json.dumps({
+            "t_rx_wall": float(sample["t_rx_wall"]),
+            "t_sim": float(sample["t_sim"]),
+            "gyro": _to_list(sample["gyro"]),
+            "accel": _to_list(sample["accel"]),
+        }) + "\n")
+        self.imu_samples += 1
+
     def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
-        print(f"[recorder] wrote {self.step} steps to {self.dir}/", flush=True)
+        for f in (self._f, self._fimu, getattr(self, "_fev", None)):
+            try:
+                if f is not None:
+                    f.close()
+            except Exception:
+                pass
+        print(f"[recorder] wrote {self.step} steps / {self.imu_samples} imu samples "
+              f"to {self.dir}/", flush=True)

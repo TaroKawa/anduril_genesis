@@ -26,13 +26,20 @@ G = 9.81
 
 class ScriptedPilot:
     def __init__(self, course: CourseSpec, device: torch.device,
-                 lookahead: float = 3.0, v_des: float = 3.0, kp_att: float = 5.0):
+                 lookahead: float = 3.0, v_des: float = 3.0, kp_att: float = 5.0,
+                 drone_cfg=None):
         self.ribbon = torch.tensor(course.ribbon_pts, device=device, dtype=torch.float32)
         self.device = device
         self.lookahead = lookahead
         self.v_des = v_des
         self.kp_att = kp_att
         self.action_map = C.ActionMap()
+        # プラント較正の補償: DroneModelはcmd_gain倍のレートを達成し、推力曲線は
+        # A=g*(t/hover)^alpha。逆算をここで合わせる(drone_cfg未指定なら旧挙動)。
+        cg = getattr(drone_cfg, "cmd_gain", (1.0, 1.0, 1.0)) if drone_cfg else (1.0, 1.0, 1.0)
+        self.inv_cmd_gain = torch.tensor([1.0 / g for g in cg], device=device)
+        self.hover = getattr(drone_cfg, "hover_thrust", C.HOVER_THRUST) if drone_cfg else C.HOVER_THRUST
+        self.alpha = getattr(drone_cfg, "thrust_alpha", 2.0) if drone_cfg else 2.0
         # 弧長テーブル
         seg = torch.linalg.norm(self.ribbon[1:] - self.ribbon[:-1], dim=1)
         self.cum = torch.cat([torch.zeros(1, device=device), torch.cumsum(seg, 0)])
@@ -88,12 +95,13 @@ class ScriptedPilot:
         dyaw = (yaw_des - yaw_now + math.pi) % (2 * math.pi) - math.pi
         yaw_rate = (1.5 * dyaw).clamp(-0.8, 0.8)
 
-        # 推力: A = |f| → thrust = hover * sqrt(A/g)
+        # 推力: A = |f| → thrust = hover * (A/g)^(1/alpha)
         A = f_norm.squeeze(1)
-        thrust = C.HOVER_THRUST * (A / G).clamp(min=0.1).sqrt()
+        thrust = self.hover * (A / G).clamp(min=0.1).pow(1.0 / self.alpha)
 
-        # 内部FRDレート → 本番指令規約へ(ProductionSigns.command_to_frdの逆 = 同じ符号積)
-        rates_frd = torch.stack([roll_rate, pitch_rate, yaw_rate], dim=1)
+        # 内部FRDレート(=達成したいレート) → 指令へ: プラントゲイン分を割り、
+        # 本番指令規約へ(ProductionSigns.command_to_frdの逆 = 同じ符号積)
+        rates_frd = torch.stack([roll_rate, pitch_rate, yaw_rate], dim=1) * self.inv_cmd_gain
         sign = torch.tensor(cmd_signs, device=self.device, dtype=rates_frd.dtype)
         rates_cmd = rates_frd * sign  # sign^2=1 なので逆変換も同じ
         cmd = torch.cat([rates_cmd, thrust.unsqueeze(1)], dim=1)

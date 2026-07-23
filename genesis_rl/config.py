@@ -27,17 +27,27 @@ class RenderConfig:
 
 @dataclass
 class DroneConfig:
+    """動力学パラメータ。既定値はDCL実シムの開ループ同定(2026-07-23,
+    runs/sysid2_* + analyze_sysid)による較正値。"""
+
     mass: float = 0.9                     # 仮定値(比力モデルなので並進には影響しない)
     inertia: tuple = (0.0065, 0.0065, 0.011)  # 仮定値(280mmレーサー相当)
-    k_rate: float = 20.0                  # レート追従P [1/s](τ≈50ms)
-    hover_thrust: float = 0.2742          # sysid
-    drag_c: float = 0.72                  # sysid(線形)
+    k_rate: float = 35.0                  # レート追従P [1/s](τ≈29ms。DCL実測t63=20〜50ms)
+    # 実シムのレートループは指令の約2.5倍の角速度を出す(開ループ実測、振幅0.02〜0.4で線形)。
+    # ここで指令に乗算してプラントごと模擬する。これで学習した方策はデプロイ時に
+    # RATE_CMD_GAINの除算が不要(dcl/client.pyがckptのcfgから自動判別)。
+    cmd_gain: tuple = (2.44, 2.46, 2.18)  # roll/pitch/yaw(DCL実測)
+    hover_thrust: float = 0.2694          # DCL実測: A = g*(t/0.2694)^1.84(旧: 0.2742)
+    thrust_alpha: float = 1.84            # 比力曲線の指数(旧想定: 2乗則)
+    drag_c: float = 0.64                  # 線形ドラッグ(DCL実測、旧: 0.72)
     rate_max: float = 4.0                 # 内部レート目標の絶対クランプ [rad/s]
     # DR倍率レンジ(エピソードごと)
     dr_mass: tuple = (0.9, 1.1)
     dr_k_rate: tuple = (0.6, 1.6)
+    dr_cmd_gain: tuple = (0.95, 1.05)
     dr_drag: tuple = (0.85, 1.15)
     dr_hover: tuple = (0.98, 1.02)
+    dr_thrust_alpha: tuple = (0.95, 1.05)
     dr_inertia: tuple = (0.7, 1.3)
 
 
@@ -79,8 +89,13 @@ class EnvConfig:
     render: RenderConfig = field(default_factory=RenderConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)
     sensors: SensorConfig = field(default_factory=SensorConfig)
-    signs_cmd: tuple = (-1.0, -1.0, -1.0)
-    signs_gyro: tuple = (-1.0, -1.0, -1.0)
+    # 指令・観測の符号(DCL実機で軸別に実測確定 2026-07-23、runs/sysid2_*):
+    #   +roll指令=右バンク(ω=+cmd)、+pitch指令=機首上げ(ω=+cmd)、+yaw指令=機首左(ω=-cmd)
+    #   生gyro = (-ω, -ω, +ω) → 観測(vec)=signs_gyro⊙ω が deploy側 -1⊙raw と一致する符号。
+    # vec-vs-cmd の関係は全軸で旧設定(-1,-1,-1)と同一(IMU帰還は不変)。変わるのは
+    # 物理回転の向き=映像に映る変化で、roll/pitchが旧設定では鏡像だった(要再学習)。
+    signs_cmd: tuple = (1.0, 1.0, -1.0)
+    signs_gyro: tuple = (1.0, 1.0, -1.0)
     signs_accel: tuple = (1.0, 1.0, 1.0)
     color_dr: bool = False                # 色DR(シーン再構築ごと。カリキュラムStage2+で有効)
     clutter: bool = False                 # 駐機機体クラッタ(Stage3+)

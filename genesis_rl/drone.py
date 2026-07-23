@@ -2,9 +2,13 @@
 
 `gs.morphs.Drone`(cf2x 27g)は質量が30倍違うため使わず、Box剛体に
 apply_links_external_force/torque(local=True)で以下を印加する:
-  推力(比力sysid): A(thrust) = g * (thrust / hover_thrust)^2、F = m*A*(body上向き)
+  推力(比力sysid): A(thrust) = g * (thrust / hover_thrust)^thrust_alpha、F = m*A*(body上向き)
   ドラッグ(sysid): F = -m * drag_c * v_world(線形)
-  レート追従:      τ = I * k_rate * (ω_sp - ω)(一次遅れτ≈1/k_rate)
+  レート追従:      ω_sp = cmd_gain * 指令、τ = I * k_rate * (ω_sp - ω)(一次遅れτ≈1/k_rate)
+
+cmd_gainはDCL実シムの実測(指令の約2.5倍の角速度を出す)をプラントごと模擬するもの。
+方策のアクションは従来どおり「送信するレート指令」で、達成レートがその約2.5倍になる。
+パラメータの出典は config.DroneConfig(2026-07-23の開ループ同定)。
 
 内部は右手系(Genesis world / body FLU)。指令・観測の左手系変換はframes.ProductionSigns。
 """
@@ -41,11 +45,15 @@ class DroneModel:
 
         c = cfg
         self.inertia = torch.tensor(c.inertia, device=device).expand(num_envs, 3).clone()
+        self.cmd_gain = torch.tensor(getattr(c, "cmd_gain", (1.0, 1.0, 1.0)),
+                                     device=device).view(1, 3)
         # エピソードごとのDR倍率
         self.mass_mul = torch.ones(num_envs, 1, device=device)
         self.k_rate_mul = torch.ones(num_envs, 1, device=device)
+        self.cmd_gain_mul = torch.ones(num_envs, 1, device=device)
         self.drag_mul = torch.ones(num_envs, 1, device=device)
         self.hover_mul = torch.ones(num_envs, 1, device=device)
+        self.alpha_mul = torch.ones(num_envs, 1, device=device)
         self.inertia_mul = torch.ones(num_envs, 1, device=device)
         # 直近の印加(IMU比力の解析計算に使う)
         self.last_specific_force_frd = torch.zeros(num_envs, 3, device=device)
@@ -60,11 +68,14 @@ class DroneModel:
         if dr:
             self.mass_mul[envs_idx] = u(*c.dr_mass)
             self.k_rate_mul[envs_idx] = u(*c.dr_k_rate)
+            self.cmd_gain_mul[envs_idx] = u(*getattr(c, "dr_cmd_gain", (1.0, 1.0)))
             self.drag_mul[envs_idx] = u(*c.dr_drag)
             self.hover_mul[envs_idx] = u(*c.dr_hover)
+            self.alpha_mul[envs_idx] = u(*getattr(c, "dr_thrust_alpha", (1.0, 1.0)))
             self.inertia_mul[envs_idx] = u(*c.dr_inertia)
         else:
-            for t in (self.mass_mul, self.k_rate_mul, self.drag_mul, self.hover_mul, self.inertia_mul):
+            for t in (self.mass_mul, self.k_rate_mul, self.cmd_gain_mul, self.drag_mul,
+                      self.hover_mul, self.alpha_mul, self.inertia_mul):
                 t[envs_idx] = 1.0
         self.last_specific_force_frd[envs_idx] = 0.0
 
@@ -93,12 +104,15 @@ class DroneModel:
         c = self.cfg
         m = c.mass * self.mass_mul
 
-        omega_sp_frd = self.signs.command_to_frd(cmd[:, :3]).clamp(-c.rate_max, c.rate_max)
+        # 実シムのプラントゲイン模擬: 達成レート目標 = cmd_gain * 指令
+        rate_cmd = cmd[:, :3] * self.cmd_gain * self.cmd_gain_mul
+        omega_sp_frd = self.signs.command_to_frd(rate_cmd).clamp(-c.rate_max, c.rate_max)
         thrust = cmd[:, 3:4].clamp(0.0, 1.0)
 
-        # 推力(比力モデル): A = g * (t/hover)^2、body上向き(FLU +z)
-        hover = HOVER_THRUST * self.hover_mul
-        A = G * (thrust / hover).pow(2)
+        # 推力(比力モデル): A = g * (t/hover)^alpha、body上向き(FLU +z)
+        hover = getattr(c, "hover_thrust", HOVER_THRUST) * self.hover_mul
+        alpha = getattr(c, "thrust_alpha", 2.0) * self.alpha_mul
+        A = G * (thrust / hover).pow(alpha)
         f_thrust_local = torch.cat([torch.zeros_like(A), torch.zeros_like(A), m * A], dim=1)
 
         # ドラッグ(world系)

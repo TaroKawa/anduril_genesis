@@ -43,8 +43,11 @@ def main():
                     help="指定すると1決定ごとに観測/行動/テレメトリを DIR/ に同期ログ"
                          "(steps.jsonl + frames/)。sim-to-sim分析・Phase2用。")
     ap.add_argument("--sysid", action="store_true",
-                    help="方策を外し、既知のレートステップ列を送って開ループでプラントの"
-                         "レートゲイン+符号を同定する(--record-dir と併用。--no-reset-on-collision推奨)")
+                    help="方策を外し、既知のコマンド列を送って開ループでプラント動力学を"
+                         "同定する(--record-dir と併用。--no-reset-on-collision推奨)")
+    ap.add_argument("--sysid-plan", choices=["rate", "roll", "yaw", "thrust", "drag"], default="rate",
+                    help="同定プラン: rate=レートゲイン線形性/時定数/遅延, yaw=yaw不感帯掃引, "
+                         "thrust=比力曲線A(thrust), drag=線形ドラッグc(解析はanalyze_sysid)")
     ap.add_argument("--gate-area-max", type=float, default=0.0,
                     help="rel_dist=1-bbox面積/この値。0で契約既定150000。実bboxはGenesis投影より"
                          "小さくrel_distが遠側に張り付くため、下げる(例25000)と接近で早く下がる")
@@ -57,6 +60,7 @@ def main():
         reset_on_collision=not args.no_reset_on_collision, relay=not args.no_relay,
         gate_detector=args.gate_detector, yolox_ckpt=args.yolox_ckpt,
         record_dir=args.record_dir or None, sysid=args.sysid,
+        sysid_plan=args.sysid_plan,
         gate_area_max=(args.gate_area_max or None))
 
 
