@@ -51,22 +51,23 @@ class Learner:
         ratio = (self.updates * self.cfg.sac.batch_size) / max(self.transitions, 1)
         return ratio < self.cfg.sac.replay_ratio_cap
 
-    def update_once(self) -> dict | None:
+    def update_once(self) -> bool | None:
         if not self.can_update():
             return None
         batch = self.sampler.sample(self.cfg.sac.batch_size)
         losses = self.agent.update(batch)
         self.updates += 1
         if self.updates % 200 == 0:
+            # ここで初めてGPU→CPU同期(200更新に1回)。損失はテンソルのまま来るのでfloat化する
             self.logger.log_scalars(self.transitions, {
-                "loss/q_priv": losses.q_priv, "loss/q_obs": losses.q_obs,
-                "loss/actor": losses.actor, "loss/alpha": losses.alpha,
-                "sac/alpha": losses.alpha_value, "sac/entropy": losses.entropy,
-                "sac/q_mean": losses.q_mean, "sac/updates": self.updates,
+                "loss/q_priv": float(losses.q_priv), "loss/q_obs": float(losses.q_obs),
+                "loss/actor": float(losses.actor), "loss/alpha": float(losses.alpha),
+                "sac/alpha": float(losses.alpha_value), "sac/entropy": float(losses.entropy),
+                "sac/q_mean": float(losses.q_mean), "sac/updates": self.updates,
                 "sac/replay_size": self.replay.size, "sac/success_size": self.success.size,
                 "sac/replay_ratio": (self.updates * self.cfg.sac.batch_size) / max(self.transitions, 1),
             })
-        return losses.__dict__
+        return True
 
     def actor_weights_cpu(self) -> dict:
         return {k: v.detach().cpu() for k, v in self.agent.actor.state_dict().items()}

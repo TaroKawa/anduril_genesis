@@ -4,23 +4,28 @@ x-gpu-all: &gpu-all
       reservations:
         devices:
           - driver: nvidia
-            device_ids: ["0", "1"] # RTX 4060 + RTX 3070 Ti(役割はプロセス内でデバイス名マッチ)
+            count: all # 8×A100-80GB を全公開(役割配分は configs/train.yaml の hw で指定)
             capabilities: [gpu]
 
 services:
-  # Phase 1: Genesis 2GPU学習(collector=3070Ti / learner=4060)
+  # Phase 1: Genesis 多GPU学習(learner=GPU0 / collector=GPU1..7、Madrona batchレンダ)
   train:
     build: .
     image: anduril-genesis-rl
     container_name: genesis-train
     <<: *gpu-all
-    shm_size: "8gb" # torch.multiprocessing の共有テンソルキュー用
+    shm_size: "128gb" # 7collector×大量envの共有テンソルキュー(torch.multiprocessing)。RAM 1.7TBのうち
     ipc: host
     cap_add: [SYS_PTRACE] # py-spyでのプロファイル用
+    ulimits:
+      memlock: -1 # ピン留めメモリ(GPU間のH2D/共有テンソル)の上限を外す
     environment:
       - PYTHONUNBUFFERED=1
       - PYOPENGL_PLATFORM=egl
-      - LP_NUM_THREADS=8 # llvmpipe(SWレンダ)のスレッド数。320x180にはこれで十分で、28本はsync負けする
+      # プロセス数(learner1+collector7=8)×スレッドで240コアを埋める。オーバーサブスクは避ける
+      - OMP_NUM_THREADS=24
+      - MKL_NUM_THREADS=24
+      - LP_NUM_THREADS=8 # sequentialフォールバック時のllvmpipeスレッド数(batchでは未使用)
     volumes:
       - .:/app
       - ./checkpoints:/app/checkpoints

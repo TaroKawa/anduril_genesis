@@ -36,6 +36,29 @@ def _pick_gpu_index(name_substr: str, fallback: int) -> int:
     return fallback
 
 
+def _resolve_gpu(spec, fallback: int) -> int:
+    """GPU指定を物理indexへ解決する。
+      - 整数 / 数字文字列("0", 3) → そのindexを直接使う(同名GPU多数の環境向け)
+      - それ以外の文字列 → デバイス名の部分一致(_pick_gpu_index)
+    """
+    if isinstance(spec, bool):
+        return fallback
+    if isinstance(spec, int):
+        return spec
+    s = str(spec).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return _pick_gpu_index(s, fallback)
+
+
+def _collector_gpu_indices(cfg) -> list[int]:
+    """collectorを配置するGPU indexのリスト(collector_gpusが空なら collector_gpu 1枚)。"""
+    gpus = getattr(cfg.hw, "collector_gpus", ()) or ()
+    if gpus:
+        return [_resolve_gpu(g, i) for i, g in enumerate(gpus)]
+    return [_resolve_gpu(cfg.hw.collector_gpu, 0)]
+
+
 def _to_cpu(batch: dict) -> dict:
     return {k: v.detach().to("cpu", non_blocking=False) for k, v in batch.items()}
 
@@ -58,7 +81,7 @@ def _load_curriculum_state(cfg) -> tuple[int, int, int]:
 
 def run_sync(cfg, resume: str | None = None, smoke: bool = False):
     # CUDA初期化前にプロセスのGPUを1枚に絞る(Genesis/taichiは可視デバイス0を使う)
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(_pick_gpu_index(cfg.hw.collector_gpu, 0)))
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(_collector_gpu_indices(cfg)[0]))
     import torch
 
     torch.set_float32_matmul_precision("high")  # Ampere: TF32行列積(数値影響は無視できる)
@@ -266,7 +289,15 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_lis
             learner.add_transitions(batch, success=(kind == "succ"))
             drained += 1
 
-        if learner.update_once() is None and drained == 0:
+        # learner(専有GPU)を遊ばせない: replay_ratio_cap に達するまで連続更新する。
+        # can_update()==False になると update_once() が None を返して自然に止まる
+        # (=UTD上限=過学習防止は replay_ratio_cap が担保。syncモードの range(64) 相当を非同期にも適用)。
+        updated = 0
+        for _ in range(128):
+            if learner.update_once() is None:
+                break
+            updated += 1
+        if updated == 0 and drained == 0:
             time.sleep(0.005)
 
         try:
@@ -310,16 +341,17 @@ def run_async(cfg, resume: str | None = None):
     # 親プロセスではCUDAを一切初期化しない(子のCUDA_VISIBLE_DEVICESを有効に保つ)
     import torch.multiprocessing as tmp
 
-    col_idx = _pick_gpu_index(cfg.hw.collector_gpu, 0)
-    lrn_idx = _pick_gpu_index(cfg.hw.learner_gpu, 1)
-    if col_idx == lrn_idx:
-        print(f"[orchestrator] 警告: collector/learnerが同一GPU({col_idx})です")
-    print(f"[orchestrator] collector=GPU{col_idx}('{cfg.hw.collector_gpu}') "
-          f"learner=GPU{lrn_idx}('{cfg.hw.learner_gpu}')")
-
+    lrn_idx = _resolve_gpu(cfg.hw.learner_gpu, 1)
+    col_indices = _collector_gpu_indices(cfg)
     n_col = max(1, int(cfg.hw.num_collectors))
+    # rank r の collector を col_indices へ round-robin で割り当てる
+    rank_gpu = [col_indices[r % len(col_indices)] for r in range(n_col)]
+    if lrn_idx in rank_gpu:
+        print(f"[orchestrator] 警告: learner(GPU{lrn_idx})とcollectorが同一GPUを共有します")
+    print(f"[orchestrator] learner=GPU{lrn_idx}  "
+          f"collectors={n_col}本 → GPU割当 {rank_gpu}")
     ctx = tmp.get_context("spawn")
-    q_trans = ctx.Queue(maxsize=256)
+    q_trans = ctx.Queue(maxsize=1024)  # 7collector分。溢れるとcollectorのput()がブロックして収集が止まる
     q_weights_list = [ctx.Queue(maxsize=4) for _ in range(n_col)]
     q_metrics = ctx.Queue(maxsize=2048)
     stop_ev = ctx.Event()
@@ -342,11 +374,18 @@ def run_async(cfg, resume: str | None = None):
             stage, seed, trans0 = _load_curriculum_state(cfg)
             rebuild_ev.clear()
             cps = [ctx.Process(target=collector_main, name=f"collector{r}",
-                               args=(cfg, col_idx, stage, seed, trans0, q_trans,
+                               args=(cfg, rank_gpu[r], stage, seed, trans0, q_trans,
                                      q_weights_list[r], q_metrics, stop_ev, rebuild_ev, r))
                    for r in range(n_col)]
-            for cp in cps:
+            # 起動をずらす: 全collectorが同時にtaichi/quadrantsのカーネルキャッシュ
+            # (/root/.cache/quadrants)へアクセスするとロック競合で全員が再コンパイルし、
+            # 再構築のたびにwarmup空白(GPU 0%)が長引く。rank0にまず生成させ、
+            # 残りは populated キャッシュを読ませることで warmup を短縮する。
+            stagger = float(os.environ.get("COLLECTOR_START_STAGGER_SEC", "12"))
+            for i, cp in enumerate(cps):
                 cp.start()
+                if stagger > 0 and i < len(cps) - 1:
+                    time.sleep(stagger)
             while lp.is_alive() and all(cp.is_alive() for cp in cps):
                 time.sleep(2.0)
             if not lp.is_alive():

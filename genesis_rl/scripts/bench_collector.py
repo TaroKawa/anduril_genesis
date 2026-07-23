@@ -24,11 +24,11 @@ def main():
     import os
 
     from ..config import load_config
-    from ..training.orchestrator import _pick_gpu_index
+    from ..training.orchestrator import _collector_gpu_indices
 
     cfg = load_config(args.config, args.set)
     cfg.run.profile = True
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(_pick_gpu_index(cfg.hw.collector_gpu, 0)))
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(_collector_gpu_indices(cfg)[0]))
 
     import torch
 

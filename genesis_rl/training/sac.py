@@ -23,13 +23,15 @@ from ..models.critic import make_obs_critic, make_priv_critic
 
 @dataclass
 class SacLosses:
-    q_priv: float
-    q_obs: float
-    actor: float
-    alpha: float
-    alpha_value: float
-    entropy: float
-    q_mean: float
+    # 値はGPUテンソル(detach済み)のまま返す。float化は200更新に1回のログ時だけ行い、
+    # 毎更新のGPU→CPU同期(連続バースト更新の直列化)を避ける。
+    q_priv: "torch.Tensor"
+    q_obs: "torch.Tensor"
+    actor: "torch.Tensor"
+    alpha: "torch.Tensor"
+    alpha_value: "torch.Tensor"
+    entropy: "torch.Tensor"
+    q_mean: "torch.Tensor"
 
 
 class SacAgent:
@@ -127,13 +129,13 @@ class SacAgent:
                 t.lerp_(s, tau)
 
         return SacLosses(
-            q_priv=float(loss_q_priv.detach()),
-            q_obs=float(loss_q_obs.detach()),
-            actor=float(loss_actor.detach()),
-            alpha=float(loss_alpha.detach()),
-            alpha_value=float(self.alpha.detach()),
-            entropy=float(-logp.detach().mean()),
-            q_mean=float(q_pi.detach().mean()),
+            q_priv=loss_q_priv.detach(),
+            q_obs=loss_q_obs.detach(),
+            actor=loss_actor.detach(),
+            alpha=loss_alpha.detach(),
+            alpha_value=self.alpha.detach(),
+            entropy=-logp.detach().mean(),
+            q_mean=q_pi.detach().mean(),
         )
 
     # --- checkpoint ---
