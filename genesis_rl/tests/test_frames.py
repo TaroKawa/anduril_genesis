@@ -3,7 +3,8 @@ import math
 import torch
 
 from genesis_rl import frames
-from genesis_rl.contracts import ActionMap, TAKEOFF_THRUST, HOVER_THRUST
+from genesis_rl.contracts import (ActionMap, TAKEOFF_THRUST, HOVER_THRUST,
+                                  RATE_LIMITS, THRUST_CENTER, THRUST_HALFSPAN)
 
 
 def test_ned_world_roundtrip():
@@ -55,13 +56,13 @@ def test_action_map():
     am = ActionMap()
     a = torch.tensor([[0.0, 0.0, 0.0, -1.0], [0.0, 0.0, 0.0, 1.0], [1.0, -1.0, 1.0, 0.0]])
     cmd = am.to_command(a)
-    assert abs(cmd[0, 3].item() - TAKEOFF_THRUST) < 1e-6   # 下限=離陸閾値
-    assert abs(cmd[1, 3].item() - 0.40) < 1e-6
-    assert abs(cmd[2, 0].item() - 0.4) < 1e-6
-    assert abs(cmd[2, 1].item() + 0.4) < 1e-6
-    assert abs(cmd[2, 2].item() - 0.1) < 1e-6
+    assert abs(cmd[0, 3].item() - (THRUST_CENTER - THRUST_HALFSPAN)) < 1e-6   # 下限=下降端
+    assert abs(cmd[1, 3].item() - (THRUST_CENTER + THRUST_HALFSPAN)) < 1e-6   # 上限=上昇端0.30
+    assert abs(cmd[2, 0].item() - RATE_LIMITS[0]) < 1e-6   # roll
+    assert abs(cmd[2, 1].item() + RATE_LIMITS[1]) < 1e-6   # pitch(a=-1)
+    assert abs(cmd[2, 2].item() - RATE_LIMITS[2]) < 1e-6   # yaw
     # ホバー推力が可動域内(非飽和)
     a_h = am.from_command(torch.tensor([[0.0, 0.0, 0.0, HOVER_THRUST]]))
-    assert -0.95 < a_h[0, 3].item() < -0.5
+    assert -1.0 < a_h[0, 3].item() < 1.0
     # 逆写像の往復
     assert torch.allclose(am.to_command(am.from_command(cmd)), cmd, atol=1e-6)

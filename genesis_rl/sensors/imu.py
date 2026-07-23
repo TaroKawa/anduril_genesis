@@ -1,4 +1,4 @@
-"""IMUシミュレーション: 40Hz実効レート(3物理ステップ毎)、ノイズ+バイアスwalk+接触スパイク。
+"""IMUシミュレーション: 60Hz実効レート(2物理ステップ毎、実機~56Hz整合)、ノイズ+バイアスwalk+接触スパイク。
 
 比力(accel)は本番HIGHRES_IMUと同じ規約: f_b = R^T (a_world - g)。
 静止+水平で (0,0,-9.81)、ピッチ-17.8°ピンで (-3.0, 0, -9.34)。
@@ -10,9 +10,12 @@ import torch
 
 from ..config import SensorConfig
 from ..frames import ProductionSigns, quat_rotate_inv
+from ..user_config import uc
 
 G_NED = 9.81
-IMU_DECIMATION = 3  # 120Hz / 3 = 40Hz
+# 実機HIGHRES_IMUは実測 ~56Hz(check/probe_telemetry 2026-07-23)。120/2=60Hz が最も近い
+# 整数デシメーション(旧40Hzより実機に近い)。config.yaml: sensor.imu_decimation。
+IMU_DECIMATION = uc("sensor", "imu_decimation", 2)  # 120Hz / 2 = 60Hz(実機~56Hzに整合)
 
 
 class ImuSim:

@@ -2,7 +2,7 @@
 
 入力 = 観測履歴 feat_hist (B,K,384) + vec_hist (B,K,55)。出力 a∈[-1,1]^4。
 トランク(TemporalTrunk)が履歴を統合し、通過ゲートone-hotはヘッドで合流。
-mean headはゼロ初期化(t=0でアクション0 = 推力0.3325の緩上昇 = 望ましいburn-in挙動)。
+mean headはゼロ初期化(t=0でアクション0 = 推力0.2694=ホバー = 望ましいburn-in挙動)。
 """
 
 from __future__ import annotations

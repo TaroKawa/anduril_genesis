@@ -124,7 +124,7 @@ class Collector:
 
     def policy_action(self, deterministic: bool = False) -> torch.Tensor:
         if self.transitions < self.cfg.sac.burn_in_steps and not deterministic:
-            # ホバーバイアス付きランダム(a3=0 → thrust 0.3325 = 緩上昇)
+            # ホバーバイアス付きランダム(a3=0 → thrust 0.2694 = ホバー)
             return (torch.randn(self.N, C.ACTION_DIM, device=self.env.device) * 0.3).clamp(-1, 1)
         with torch.no_grad():
             return self.actor.act(self._feat_hist, self._vec_hist, deterministic=deterministic)

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from .user_config import uc   # config.yaml のユーザー調整値(物理/符号/センサ。無ければ既定値)
+
 
 @dataclass
 class HwConfig:
@@ -27,53 +29,50 @@ class RenderConfig:
 
 @dataclass
 class DroneConfig:
-    """動力学パラメータ。既定値はDCL実シムの開ループ同定(2026-07-23,
-    runs/sysid2_* + analyze_sysid)による較正値。"""
+    """動力学パラメータ。既定値は config.yaml(dynamics/domain_rand)から。無ければ DCL実機
+    open-loop sysid(2026-07-23, runs/sysid_bit16_* + analyze_sysid)較正値へフォールバック。"""
 
-    mass: float = 0.9                     # 仮定値(比力モデルなので並進には影響しない)
-    inertia: tuple = (0.0065, 0.0065, 0.011)  # 仮定値(280mmレーサー相当)
-    k_rate: float = 35.0                  # レート追従P [1/s](τ≈29ms。DCL実測t63=20〜50ms)
-    # 【bit16(rev3390 rad/s)採用 2026-07-23】SET_ATTITUDE_TARGET.type_mask の bit16 を立てて
-    # シムに真の rad/s 指令を送ると、達成レート≈指令(実測 roll/pitch 0.99・yaw 0.89、
-    # runs/sysid_bit16_0723)。旧レガシー解釈の ~2.5倍(2.44/2.46/2.18)はこのbit欠落が原因。
-    # ここでプラントゲインを模擬(達成レート=cmd_gain×指令)。デプロイは dcl/client.py が
-    # bit16 ON かつ ckpt の cmd_gain 一致で送信スケール=1.0(除算/乗算なし)にする。
-    cmd_gain: tuple = (1.0, 1.0, 0.89)    # roll/pitch/yaw(bit16 実測。yawは元来 ~0.89倍)
-    hover_thrust: float = 0.2694          # DCL実測: A = g*(t/0.2694)^1.84(旧: 0.2742)
-    thrust_alpha: float = 1.84            # 比力曲線の指数(旧想定: 2乗則)
-    drag_c: float = 0.64                  # 線形ドラッグ(DCL実測、旧: 0.72)
-    rate_max: float = 4.0                 # 内部レート目標の絶対クランプ [rad/s]
-    # DR倍率レンジ(エピソードごと)
-    dr_mass: tuple = (0.9, 1.1)
-    dr_k_rate: tuple = (0.6, 1.6)
-    dr_cmd_gain: tuple = (0.95, 1.05)
-    dr_drag: tuple = (0.85, 1.15)
-    dr_hover: tuple = (0.98, 1.02)
-    dr_thrust_alpha: tuple = (0.95, 1.05)
-    dr_inertia: tuple = (0.7, 1.3)
+    mass: float = uc("dynamics", "mass", 0.9)
+    inertia: tuple = uc("dynamics", "inertia", (0.0065, 0.0065, 0.011))
+    k_rate: float = uc("dynamics", "k_rate", 35.0)          # レート追従P [1/s]
+    cmd_gain: tuple = uc("dynamics", "cmd_gain", (1.0, 1.0, 0.89))  # 達成レート=cmd_gain×指令
+    hover_thrust: float = uc("dynamics", "hover_thrust", 0.2694)   # A = g*(t/hover)^alpha
+    thrust_alpha: float = uc("dynamics", "thrust_alpha", 1.84)
+    drag_c: float = uc("dynamics", "drag_c", 0.64)          # 線形ドラッグ
+    rate_max: float = uc("dynamics", "rate_max", 4.0)       # 内部レート目標クランプ [rad/s]
+    # DR倍率レンジ(エピソードごと)。config.yaml: domain_rand
+    dr_mass: tuple = uc("domain_rand", "mass", (0.9, 1.1))
+    dr_k_rate: tuple = uc("domain_rand", "k_rate", (0.6, 1.6))
+    dr_cmd_gain: tuple = uc("domain_rand", "cmd_gain", (0.95, 1.05))
+    dr_drag: tuple = uc("domain_rand", "drag", (0.85, 1.15))
+    dr_hover: tuple = uc("domain_rand", "hover", (0.98, 1.02))
+    dr_thrust_alpha: tuple = uc("domain_rand", "thrust_alpha", (0.95, 1.05))
+    dr_inertia: tuple = uc("domain_rand", "inertia", (0.7, 1.3))
 
 
 @dataclass
 class SensorConfig:
-    accel_sigma: float = 0.4              # [m/s^2] 白色
-    accel_bias_init: float = 0.2
-    accel_bias_walk: float = 0.01
-    accel_spike_p: float = 0.001
-    gyro_sigma: float = 0.008             # [rad/s]
-    gyro_bias_init: float = 0.02
-    gyro_bias_walk: float = 0.001
-    det_px_base: float = 2.0              # σ_px(d) = base + gain/max(d,1)(近いほどノイズ大)
-    det_px_gain: float = 40.0
-    det_dropout_base: float = 0.02
-    det_dropout_close: float = 0.10       # 至近でのドロップアウト増分
-    det_outlier_p: float = 0.01           # 偽検出(白ロゴ等の誤検出の模擬)
-    det_delay_frames: int = 1             # 17.3ms検出遅延 → 1フレーム
-    det_delay_jitter: int = 1
-    img_delay_frames: int = 1             # JPEG+UDP相当
-    img_delay_jitter: int = 1
-    act_delay_steps: int = 0              # アクション遅延(物理ステップ)
-    act_delay_jitter: int = 1
-    noise_scale: float = 1.0              # カリキュラムが 0.3/0.6/1.0 を設定
+    """IMU/検出ノイズ・遅延。既定値は config.yaml: sensor から。"""
+
+    accel_sigma: float = uc("sensor", "accel_sigma", 0.4)          # [m/s^2] 白色
+    accel_bias_init: float = uc("sensor", "accel_bias_init", 0.2)
+    accel_bias_walk: float = uc("sensor", "accel_bias_walk", 0.01)
+    accel_spike_p: float = uc("sensor", "accel_spike_p", 0.001)
+    gyro_sigma: float = uc("sensor", "gyro_sigma", 0.008)          # [rad/s]
+    gyro_bias_init: float = uc("sensor", "gyro_bias_init", 0.02)
+    gyro_bias_walk: float = uc("sensor", "gyro_bias_walk", 0.001)
+    det_px_base: float = uc("sensor", "det_px_base", 2.0)          # σ_px(d)=base+gain/max(d,1)
+    det_px_gain: float = uc("sensor", "det_px_gain", 40.0)
+    det_dropout_base: float = uc("sensor", "det_dropout_base", 0.02)
+    det_dropout_close: float = uc("sensor", "det_dropout_close", 0.10)  # 至近ドロップアウト増分
+    det_outlier_p: float = uc("sensor", "det_outlier_p", 0.01)     # 偽検出
+    det_delay_frames: int = uc("sensor", "det_delay_frames", 1)    # 17.3ms検出遅延→1フレーム
+    det_delay_jitter: int = uc("sensor", "det_delay_jitter", 1)
+    img_delay_frames: int = uc("sensor", "img_delay_frames", 1)    # JPEG+UDP相当
+    img_delay_jitter: int = uc("sensor", "img_delay_jitter", 1)
+    act_delay_steps: int = uc("sensor", "act_delay_steps", 0)      # アクション遅延(物理ステップ)
+    act_delay_jitter: int = uc("sensor", "act_delay_jitter", 1)
+    noise_scale: float = 1.0              # カリキュラムが 0.3/0.6/1.0 を設定(実行時可変・非静的)
 
 
 @dataclass
@@ -84,24 +83,20 @@ class EnvConfig:
     stage: int = 0
     max_episode_s: float = 60.0
     no_gate_timeout_s: float = 5.0
-    collision_grace_s: float = 1.0
-    spawn_below_center: float = 0.3       # スタートゲート中心からの下オフセット [m]
-    spawn_pitch_deg: float = -17.8        # 前傾(実測)
-    spawn_jitter_deg: float = 2.0
+    # 物理系(config.yaml: env_physics)。衝突グレースは発進ピン解除の反力残り(~17g)を除外。
+    collision_grace_s: float = uc("env_physics", "collision_grace_s", 1.5)
+    spawn_below_center: float = uc("env_physics", "spawn_below_center", 0.3)  # 中心からの下[m]
+    spawn_pitch_deg: float = uc("env_physics", "spawn_pitch_deg", -17.8)      # 前傾(実測)
+    spawn_jitter_deg: float = uc("env_physics", "spawn_jitter_deg", 2.0)
     render: RenderConfig = field(default_factory=RenderConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)
     sensors: SensorConfig = field(default_factory=SensorConfig)
-    # 指令・観測の符号。【bit16採用で signs_cmd を再導出 2026-07-23】
-    # bit16(rad/s)では 指令→物理回転 が旧レガシー解釈から全軸で反転する(解析比が
-    # 旧 -raw/cmd=+2.5 → bit16 -raw/cmd=-1.0、runs/sysid_bit16_0723)。物理→IMU→観測の
-    # フレーム関係(gyro_out_sign / deploy GYRO_OBS_SIGN)は不変なので、
-    #   omega_frd/cmd = (+1,+1,-1)⊙(達成レート/cmd) より
-    #   legacy: (+1,+1,-1)⊙(+2.44,+2.46,+2.18)=(+2.44,+2.46,-2.18) [signs_cmd=(+1,+1,-1)]
-    #   bit16 : (+1,+1,-1)⊙(-0.99,-0.99,-0.89)=(-0.99,-0.99,+0.89) [signs_cmd=(-1,-1,+1)]
-    # → signs_cmd のみ反転、signs_gyro/accel は据え置き。観測(vec)一致は維持(下記検証済)。
-    signs_cmd: tuple = (-1.0, -1.0, 1.0)
-    signs_gyro: tuple = (1.0, 1.0, -1.0)
-    signs_accel: tuple = (1.0, 1.0, 1.0)
+    # 指令・観測の符号(左手系挙動の再現)。config.yaml: signs。
+    # bit16採用で signs_cmd を(+1,+1,-1)→(-1,-1,+1)へ再導出(指令→物理回転が全軸反転、
+    # signs_gyro/accel は据え置き。runs/sysid_bit16_0723)。詳細は config.yaml / sim2sim-gaps。
+    signs_cmd: tuple = uc("signs", "cmd", (-1.0, -1.0, 1.0))
+    signs_gyro: tuple = uc("signs", "gyro", (1.0, 1.0, -1.0))
+    signs_accel: tuple = uc("signs", "accel", (1.0, 1.0, 1.0))
     color_dr: bool = False                # 色DR(シーン再構築ごと。カリキュラムStage2+で有効)
     clutter: bool = False                 # 駐機機体クラッタ(Stage3+)
 

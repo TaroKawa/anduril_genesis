@@ -28,44 +28,34 @@ import time
 
 import numpy as np
 
+from ..user_config import uc   # config.yaml: deploy セクションのユーザー調整値(無ければ既定値)
+
 MAVLINK_CMD_SIM_RESET = 31000
 ENCAPSULATED_RACE_STATUS_MSG_ID = 1
-COLLISION_ACCEL_MPS2 = 40.0
-# 本番HIGHRES_IMUのgyroは学習側の観測規約(frames.ProductionSigns.gyro_out_sign=-1、
-# Spakona estimatorのgyro_sign=[-1,-1,-1]と同一)に対して符号反転している。生値のまま
-# vecに入れると方策のレート帰還が正帰還になり発進直後から転がる(2026-07-23 実機ログで確定:
-# 指令→gyro応答比が全軸-2.5→-1倍で+2.5=負帰還)。ここで学習規約へ揃える。
-GYRO_OBS_SIGN = (-1.0, -1.0, -1.0)
-ACCEL_OBS_SIGN = (1.0, 1.0, 1.0)   # accelは整合(実機ログで level rest≈(0,0,-9.81)を確認)
-# 実シムのレートループは指令の約2.5倍の角速度を出す(振幅0.02〜0.4で線形、sysid v2で確定:
-# runs/sysid2_rate_0723 / sysid2_yaw_0723)。旧ckpt(Genesisが指令=達成レート≈1倍のプラント
-# で学習)はデプロイ側で送信レートをこのゲインで割って達成レートを方策の意図値へ揃える。
-# 新ckpt(config.py drone.cmd_gainでプラントごと模擬して学習)は除算不要 —
-# GenesisPilotがckptのcfgスナップショットから自動判別する。
-RATE_CMD_GAIN = (2.44, 2.46, 2.18)
-# rev3390: SET_ATTITUDE_TARGET.type_mask の拡張bit16を立てると、シムは body_rates を
-# 正しい物理 rad/s として解釈する(公式サンプル check/controller.py で判明)。立てない
-# レガシー解釈こそが上記 ~2.5倍ゲインの正体。
-# 【bit16付き開ループ同定で確定 2026-07-23 runs/sysid_bit16_0723】3軸すべてで:
-#   ・大きさ: レート定常ゲイン |達成/指令| = roll 0.99 / pitch 0.99 / yaw 0.89(≈1.0、線形)。
-#     → レガシーの ~2.5倍は解釈bitの欠落が原因。bit16でほぼ1:1になる。
-#   ・符号: 生gyroが指令と *同符号* になる(指令-0.3→生gyro-0.30)。レガシーは逆符号だった
-#     ため、既存の観測符号 GYRO_OBS_SIGN=-1 / EnvConfig.signs_* はレガシー挙動に合わせて
-#     逆算されている。→ bit16 を採用すると符号系も破綻するので **ドロップイン不可**。
-#     採用にはGYRO_OBS_SIGN→+1・signs再導出・cmd_gain→(1,1,0.89)相当・**fresh再学習**が必要。
-# よって既定は False(現行のレガシー較正のまま=無回帰)。True は上記一式を揃えた
-# 新ckpt専用のオプトインとして残す。送信スケールは train_cmd_gain/deploy_plant_gain で一意
-# (GenesisPilot参照。False時は従来の RATE_CMD_GAIN 除算と数値的に等価)。
+ENCAPSULATED_TRACK_INFO_MSG_ID = 2   # ゲート位置/向き/寸法(VQ1で有効、VQ2では null化)
+# ↓デプロイ調整値は config.yaml: deploy が単一ソース(下は無ければの既定値)。
+COLLISION_ACCEL_MPS2 = uc("deploy", "collision_accel_mps2", 40.0)  # |accel|>これで衝突検知
+# 実YOLOX/HSVのbbox面積は幾何投影より小さく(同距離で約1/5、runs/sysid_bit16_0723)、
+# デプロイ側 rel_dist を学習側に合わせるため実検出器の GATE_AREA_MAX 既定を下げる(--gate-area-maxで上書き可)。
+REAL_GATE_AREA_MAX = uc("deploy", "real_gate_area_max", 25000.0)
+# 生HIGHRES_IMU gyro は学習の観測規約に対し符号反転。ここで規約へ揃える(生値のままだと正帰還)。
+GYRO_OBS_SIGN = uc("deploy", "gyro_obs_sign", (-1.0, -1.0, -1.0))
+ACCEL_OBS_SIGN = uc("deploy", "accel_obs_sign", (1.0, 1.0, 1.0))   # accelは整合
+# レガシー(bit16 off)時の実シム・プラントゲイン(達成レート≈2.5×指令)。旧ckptはこれで割る。
+RATE_CMD_GAIN = uc("deploy", "rate_cmd_gain", (2.44, 2.46, 2.18))
+# rev3390: type_mask の bit16 を立てるとシムが body_rates を真の rad/s として解釈(=達成≈指令)。
+# 立てないレガシー解釈が ~2.5倍ゲインの正体。採用は符号再導出+cmd_gain+RATE_LIMITS+fresh再学習と一式
+# (詳細は memory sim2sim-gaps / dcl-telemetry-contract)。bit自体は規約なのでコード固定。
 DCL_BODY_RATES_RADS_BIT = 16
-USE_RAD_PER_SEC_BODY_RATES = True   # 【bit16 完全移行 2026-07-23】符号再導出(config.signs_cmd
-                                    # →(-1,-1,+1))+ cmd_gain→(1,1,0.89) + RATE_LIMITS更新 +
-                                    # fresh再学習 と一式で採用。旧ckptは False に戻して使用。
-# bit16 ON時の実シムのレート・プラントゲイン|達成/指令|(runs/sysid_bit16_0723)。
-# 送信スケール(train_cmd_gain/deploy_gain)の分母に使う。ckptの cmd_gain がこれと一致すれば
-# 送信スケール=1.0(そのまま送る)。OFF時はレガシーの RATE_CMD_GAIN を使う。
-RATE_PLANT_GAIN_RADS = (1.0, 1.0, 0.89)
-HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(フェイルセーフ用)
-CONTROL_HZ = 250.0             # コマンド送信レート(シム仕様)
+USE_RAD_PER_SEC_BODY_RATES = uc("deploy", "use_rad_per_sec_body_rates", True)  # 旧ckptは false
+# bit16 ON時の実機レート・プラントゲイン|達成/指令|。送信スケール(train/deploy)の分母。
+RATE_PLANT_GAIN_RADS = uc("deploy", "rate_plant_gain_rads", (1.0, 1.0, 0.89))
+HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(参考値)
+# スタート出力=ピン解除の閾値。ピン解除前(pin_released=False)はこの値を出す。thrustレンジの
+# 下端(0.239)は下降用に下げたが、スタートでそれを出すとピンが外れず発進できないため、
+# ピン中は必ず 0.265 を出す(方策はピン解除後にのみ介入する)。
+START_THRUST = uc("deploy", "start_thrust", 0.265)   # = contracts.TAKEOFF_THRUST
+CONTROL_HZ = 250.0             # コマンド送信レート(シム仕様。構造値)
 VIDEO_W, VIDEO_H = 640, 360
 
 
@@ -86,11 +76,15 @@ class MavlinkIO:
         print(f"MAVLink: connected to system {self.conn.target_system}", flush=True)
 
         self._last_hb_ms = 0
+        self._last_ts_ms = 0
         self._last_collision_t = 0.0
         # レース開始判定の残骸検出(Spakona mavlink_rx.py の移植)
         self._initial_race_start = None
         self._stale_initial_start = False
         self._last_sim_boot_ms = None
+        # トラック情報(ゲート幾何)の再組立て用。VQ1で受信、VQ2ではnull化で来ない。
+        self._track_chunks: dict = {}
+        self._track_expected: dict = {}
         self.is_running = True
         self.thread = threading.Thread(target=self._rx_loop, daemon=True)
         self.thread.start()
@@ -114,6 +108,12 @@ class MavlinkIO:
                 raw = bytes(msg.data)
                 if raw and raw[0] == ENCAPSULATED_RACE_STATUS_MSG_ID:
                     self._on_race_status(raw)
+                elif raw and raw[0] == ENCAPSULATED_TRACK_INFO_MSG_ID:
+                    self._on_track_packet(msg, raw)
+            elif t == "DATA_TRANSMISSION_HANDSHAKE":
+                # トラックデータ転送の開始通知(公式サンプル流用): width=転送ID, packets=chunk数
+                self._track_chunks[msg.width] = {}
+                self._track_expected[msg.width] = msg.packets
 
     def _on_imu(self, msg):
         accel = (msg.xacc, msg.yacc, msg.zacc)
@@ -170,6 +170,37 @@ class MavlinkIO:
             "t_wall": time.time(),
         }
 
+    def _on_track_packet(self, msg, raw):
+        """トラック情報(sub-type2)チャンクを再組立て(公式 mavlink_rx.py 移植)。
+
+        VQ1(テレメトリ有効)でのみ受信。全chunk揃ったら _on_track_data で解析し
+        shared["track"] に実ゲート幾何(NED位置/向き/寸法)を格納する。VQ2ではnull化で
+        そもそも来ないため shared["track"] は設定されない。
+        """
+        _, transfer_id = struct.unpack_from("<BH", raw)
+        if transfer_id not in self._track_expected:
+            return
+        self._track_chunks[transfer_id][msg.seqnr] = raw[3:]
+        if len(self._track_chunks[transfer_id]) == self._track_expected[transfer_id]:
+            payload = b"".join(self._track_chunks[transfer_id][i]
+                               for i in range(self._track_expected[transfer_id]))
+            del self._track_chunks[transfer_id]
+            del self._track_expected[transfer_id]
+            self._on_track_data(payload)
+
+    def _on_track_data(self, payload):
+        (num_gates,) = struct.unpack_from("<H", payload)
+        payload = payload[2:]
+        gates = []
+        for _ in range(num_gates):
+            (gid, px, py, pz, qw, qx, qy, qz, w, h) = struct.unpack_from("<Hfffffffff", payload)
+            payload = payload[38:]
+            gates.append({"gate_id": int(gid), "pos_ned": (px, py, pz),
+                          "quat_ned": (qw, qx, qy, qz), "width": w, "height": h})
+        self.shared["track"] = {"num_gates": int(num_gates), "gates": gates,
+                                "t_wall": time.time()}
+        print(f"[dcl] TRACK受信: {num_gates}ゲート(VQ1テレメトリ有効)", flush=True)
+
     # --- 送信 ---
 
     def send_rates(self, roll_rate: float, pitch_rate: float, yaw_rate: float, thrust: float):
@@ -185,10 +216,15 @@ class MavlinkIO:
 
     def heartbeat_if_due(self):
         now_ms = int(time.time() * 1000)
-        if now_ms - self._last_hb_ms < 500:  # 2Hz
+        m = self.mavutil.mavlink
+        # TIMESYNC 10Hz(公式サンプル timesync.py 準拠。シムのサーバ時刻同期に用いられる)
+        if now_ms - self._last_ts_ms >= 100:
+            self._last_ts_ms = now_ms
+            self.conn.mav.timesync_send(int(time.time_ns()), 0)   # tc1=client time, ts1=0(request)
+        # HEARTBEAT 2Hz
+        if now_ms - self._last_hb_ms < 500:
             return
         self._last_hb_ms = now_ms
-        m = self.mavutil.mavlink
         self.conn.mav.heartbeat_send(m.MAV_TYPE_GCS, m.MAV_AUTOPILOT_INVALID, 0, 0, 0)
 
     def arm(self):
@@ -408,7 +444,7 @@ class ScriptedRatePilot:
             self.loop = body
         elif plan == "thrust":
             self.prefix = [climb, self.LEVEL, (0.7, 0, 0, 0, h)]
-            # (上げ, 対称の下げ)ペア: 下げ側は実測曲線 A≈g*(t/0.269)^1.64 で净v_z≈0に
+            # (上げ, 対称の下げ)ペア: 下げ側は実測曲線 A≈g*(t/0.2694)^1.84 で净v_z≈0に
             # なるよう選定(初回計測 runs/sysid2_thrust_0723 のフィット)。想定が外れても
             # ドリフトするだけで、解析側はv_z推定で補正する。方策レンジ[0.265,0.40]重視。
             pairs = [(0.30, 0.235), (0.32, 0.211), (0.34, 0.183), (0.37, 0.132),
@@ -602,10 +638,14 @@ def make_gate_detector(kind: str, yolox_ckpt: str, gate_area_max: float | None =
     kind="yolox": YOLOX-x を GPU/CPU にロード。重みが無い/初期化失敗時は
     警告して HSV にフォールバックする(飛行自体は止めない)。
     kind="hsv":   従来の HSV 色検出。
-    gate_area_max: rel_dist正規化のoverride(実bbox較正用。Noneで契約既定150000)。
+    gate_area_max: rel_dist正規化のoverride(実bbox較正用)。None のときは実検出器の既定
+                   REAL_GATE_AREA_MAX(=25000、実bboxは幾何投影より小さい分の一次較正)を使う。
+                   --gate-area-max で明示指定すればそれを優先。
     """
     import functools
 
+    if gate_area_max is None:
+        gate_area_max = REAL_GATE_AREA_MAX
     hsv = functools.partial(gate_detect_hsv, gate_area_max=gate_area_max)
     if kind == "hsv":
         return hsv
@@ -711,7 +751,7 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
             mav.arm()
         print("Starting Genesis-RL DCL loop... (Ctrl+C to stop)", flush=True)
         t_start = time.time()
-        cmd = (0.0, 0.0, 0.0, HOVER_THRUST)
+        cmd = (0.0, 0.0, 0.0, START_THRUST)   # ピン解除まではスタート推力(0.265)を出す
         next_policy_t = 0.0
         next_tx_t = 0.0
         last_status_t = 0.0
@@ -733,7 +773,7 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
                         shared=shared,
                         collision=bool(col and not col.get("handled")))
             if not flying:
-                cmd = (0.0, 0.0, 0.0, HOVER_THRUST)  # ピン中/待機はフェイルセーフ
+                cmd = (0.0, 0.0, 0.0, START_THRUST)  # ピン中/待機はスタート推力(0.265)でピン解除
 
             if now >= next_tx_t:                     # 250Hzで送信
                 next_tx_t = max(next_tx_t + 1.0 / CONTROL_HZ, now)

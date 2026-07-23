@@ -1,0 +1,111 @@
+# ============================================================================
+# config.yaml — 物理 / アクション / 符号 / センサ / デプロイ のユーザー調整ノブ(単一ソース)
+#
+#   ここを編集すればコードを触らずに挙動を変えられる。genesis_rl/user_config.py が読み込み、
+#   contracts.py / config.py / dcl/client.py / sensors/imu.py の各定数を初期化する。
+#   キーを消す/ファイルを消すと、各モジュールのコード内既定値(=下と同値)にフォールバック。
+#
+#   ※学習ハイパラ(sac / curriculum / run / hw と env のエピソード設定)は configs/train.yaml。
+#   ※値を変えると contract_hash が変わり学習済みckptと非互換になる項目がある(action/observation)。
+# ============================================================================
+
+# --- アクションマッピング(方策 a∈[-1,1]^4 → 物理指令)。contracts.py ---
+action:
+  rate_limits:    [1.0, 1.0, 1.0]   # roll/pitch/yaw の指令レート上限 [rad/s](a=±1で±これ)
+  thrust_center:  0.2694            # a3=0 の推力(=ホバー)
+  thrust_halfspan: 0.0306           # → thrust ∈ [0.2388, 0.30]。下端=下降、上端=上昇
+  hover_thrust:   0.2742            # A==g 参考値(フェイルセーフ/逆写像用)
+  takeoff_thrust: 0.265             # 離陸/ピン解除の閾値(スタート出力。deploy START_THRUST)
+
+# --- 観測スケール & ゲート検出。contracts.py ---
+observation:
+  rate_scale:        4.0            # gyro 正規化 [rad/s]
+  accel_scale:       25.0           # accel 正規化 [m/s^2]
+  v_scale:           15.0           # 特権 velocity [m/s]
+  pos_scale:         60.0           # 特権 position [m]
+  gate_rel_scale:    30.0           # 特権 ゲート相対位置 [m]
+  gate_area_max:     150000.0       # 学習側 rel_dist = 1 - bbox_area/これ(Genesis投影)
+  gate_obs_max_age_s: 0.5           # これより古い検出は未検出扱い
+  detect_latency_s:  0.0173         # 物体検出遅延(17.3ms)
+
+# --- カメラ(実飛行でfit済みのintrinsics/取り付け)。contracts.py ---
+camera:
+  img_w: 640
+  img_h: 360
+  fx: 320.0
+  fy: 320.0
+  cx: 320.0
+  cy: 180.0
+  tilt_deg: 20.0                    # ボディから上向き
+
+# --- タイミング(本番シム仕様)。contracts.py ---
+timing:
+  phys_hz: 120
+  decimation: 4                     # 1決定=4物理ステップ → 30Hz
+
+# --- 動力学(DCL実機 open-loop sysid で較正)。config.py DroneConfig ---
+dynamics:
+  mass:         0.9
+  inertia:      [0.0065, 0.0065, 0.011]
+  k_rate:       35.0                # レート追従P [1/s]
+  cmd_gain:     [1.0, 1.0, 0.89]    # bit16実測: 達成レート=cmd_gain×指令(roll/pitch~1.0, yaw0.89)
+  hover_thrust: 0.2694              # A = g*(t/0.2694)^1.84
+  thrust_alpha: 1.84
+  drag_c:       0.64                # 線形ドラッグ
+  rate_max:     4.0                 # 内部レート目標クランプ [rad/s]
+
+# --- ドメインランダム化(エピソード毎の倍率レンジ)。config.py DroneConfig ---
+domain_rand:
+  mass:         [0.9, 1.1]
+  k_rate:       [0.6, 1.6]
+  cmd_gain:     [0.95, 1.05]
+  drag:         [0.85, 1.15]
+  hover:        [0.98, 1.02]
+  thrust_alpha: [0.95, 1.05]
+  inertia:      [0.7, 1.3]
+
+# --- 指令/観測の符号(左手系挙動の再現。bit16でsigns_cmdを再導出)。config.py EnvConfig ---
+signs:
+  cmd:   [-1.0, -1.0, 1.0]          # 指令→内部FRDレート目標の符号
+  gyro:  [1.0, 1.0, -1.0]           # 内部FRD角速度→観測gyroの符号
+  accel: [1.0, 1.0, 1.0]
+
+# --- センサ(IMU/検出ノイズ・遅延)。config.py SensorConfig + sensors/imu.py ---
+sensor:
+  imu_decimation:    2              # 120Hz/2=60Hz(実機~56Hz整合)
+  accel_sigma:       0.4
+  accel_bias_init:   0.2
+  accel_bias_walk:   0.01
+  accel_spike_p:     0.001
+  gyro_sigma:        0.008
+  gyro_bias_init:    0.02
+  gyro_bias_walk:    0.001
+  det_px_base:       2.0
+  det_px_gain:       40.0
+  det_dropout_base:  0.02
+  det_dropout_close: 0.10
+  det_outlier_p:     0.01
+  det_delay_frames:  1
+  det_delay_jitter:  1
+  img_delay_frames:  1
+  img_delay_jitter:  1
+  act_delay_steps:   0
+  act_delay_jitter:  1
+
+# --- スポーン/衝突(学習環境)。config.py EnvConfig ---
+env_physics:
+  collision_grace_s:  1.5           # 発進ピン解除の反力残りを除外(実機deploy 1.5sと整合)
+  spawn_below_center: 0.3
+  spawn_pitch_deg:    -17.8         # 前傾(実測)
+  spawn_jitter_deg:   2.0
+
+# --- 本番シム推論(デプロイ)。dcl/client.py ---
+deploy:
+  use_rad_per_sec_body_rates: true  # bit16(rev3390 rad/s)。旧ckptを飛ばす時のみ false
+  rate_plant_gain_rads: [1.0, 1.0, 0.89]  # bit16時の実機レート・プラントゲイン(送信スケール分母)
+  rate_cmd_gain:        [2.44, 2.46, 2.18]  # レガシー(bit16 off)時のプラントゲイン
+  real_gate_area_max:   25000.0     # 実YOLOX/HSVのrel_dist較正(投影より小さい分)
+  start_thrust:         0.265       # ピン解除前に出す推力(= takeoff_thrust)
+  gyro_obs_sign:        [-1.0, -1.0, -1.0]  # 生HIGHRES_IMU gyro→観測 の符号
+  accel_obs_sign:       [1.0, 1.0, 1.0]
+  collision_accel_mps2: 40.0        # |accel|>これ で衝突検知(発進1.5sグレース後)

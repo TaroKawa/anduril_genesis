@@ -16,33 +16,38 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-# --- タイミング(本番シム仕様 §3.2 / §4.6) ---
-PHYS_HZ = 120
-DECIMATION = 4          # 1決定 = 4物理ステップ = 30Hz(カメラフレームと同期)
+from .user_config import uc   # config.yaml のユーザー調整値(無ければ下の既定値)
+
+# --- タイミング(本番シム仕様 §3.2 / §4.6)。config.yaml: timing ---
+PHYS_HZ = uc("timing", "phys_hz", 120)
+DECIMATION = uc("timing", "decimation", 4)  # 1決定 = 4物理ステップ = 30Hz(カメラ同期)
 POLICY_HZ = PHYS_HZ / DECIMATION  # 30.0
 DT_PHYS = 1.0 / PHYS_HZ
 DT_POLICY = DECIMATION * DT_PHYS
 
-# --- カメラ(仕様 §3.8。fx=fy=320 が実飛行で検証済みのintrinsics) ---
-IMG_W, IMG_H = 640, 360
-FX = FY = 320.0
-CX, CY = 320.0, 180.0
-CAM_TILT_DEG = 20.0     # ボディから上向き20°(実飛行でfit済み)
+# --- カメラ(fx=fy=320 が実飛行で検証済みのintrinsics)。config.yaml: camera ---
+IMG_W = uc("camera", "img_w", 640)
+IMG_H = uc("camera", "img_h", 360)
+FX = uc("camera", "fx", 320.0)
+FY = uc("camera", "fy", 320.0)
+CX = uc("camera", "cx", 320.0)
+CY = uc("camera", "cy", 180.0)
+CAM_TILT_DEG = uc("camera", "tilt_deg", 20.0)  # ボディから上向き(実飛行でfit済み)
 VFOV_DEG = float(2.0 * np.degrees(np.arctan2(CY, FY)))  # 58.715°(specの"90"はfyと矛盾)
 RESNET_RES = 224
 
-# --- 検出(Spakona YOLOX パイプライン互換) ---
-DETECT_LATENCY_S = 0.0173     # 物体検出 17.3 ms → 決定時に見えるのは前フレームの検出
-GATE_AREA_MAX = 150000.0      # rel_dist = 1 - bbox_area/GATE_AREA_MAX (Spakona互換)
-GATE_OBS_MAX_AGE_S = 0.5      # これより古い検出は未検出扱い
+# --- 検出。config.yaml: observation ---
+DETECT_LATENCY_S = uc("observation", "detect_latency_s", 0.0173)  # 物体検出遅延
+GATE_AREA_MAX = uc("observation", "gate_area_max", 150000.0)  # rel_dist=1-bbox_area/これ
+GATE_OBS_MAX_AGE_S = uc("observation", "gate_obs_max_age_s", 0.5)  # 古い検出は未検出扱い
 
-# --- 観測スケール(Spakona rl_config.yaml 互換) ---
-RATE_SCALE = 4.0        # gyro [rad/s]
-ACCEL_SCALE = 25.0      # accel [m/s^2](accel_max)
-V_SCALE = 15.0          # 特権velocity [m/s]
-POS_SCALE = 60.0        # 特権position [m]
-GATE_REL_SCALE = 30.0   # 特権ゲート相対位置 [m]
-MAX_GATES = 40          # 通過ゲートone-hot長(Spakona max_gates)
+# --- 観測スケール。config.yaml: observation ---
+RATE_SCALE = uc("observation", "rate_scale", 4.0)      # gyro [rad/s]
+ACCEL_SCALE = uc("observation", "accel_scale", 25.0)   # accel [m/s^2](accel_max)
+V_SCALE = uc("observation", "v_scale", 15.0)           # 特権velocity [m/s]
+POS_SCALE = uc("observation", "pos_scale", 60.0)       # 特権position [m]
+GATE_REL_SCALE = uc("observation", "gate_rel_scale", 30.0)  # 特権ゲート相対位置 [m]
+MAX_GATES = 40          # 通過ゲートone-hot長。VEC layout に直結=構造値のためコード固定
 
 # --- vec レイアウト(55次元) ---
 VEC_GYRO = slice(0, 3)
@@ -64,17 +69,14 @@ PRIV_DIM = 39
 
 ACTION_DIM = 4
 
-# --- 推力・レートのアクションマッピング(env側。ネットは常に[-1,1]^4) ---
-HOVER_THRUST = 0.2742           # sysid: A==g となる指令推力
-TAKEOFF_THRUST = 0.265          # これ未満では離陸できない(A(0.265)=9.16 < g)
-THRUST_CENTER = 0.3325          # レンジ [0.265, 0.40] の中心
-THRUST_HALFSPAN = 0.0675
-# roll, pitch, yaw [rad/s]。【bit16採用で更新 2026-07-23】cmd_gain が 2.5→~1.0 になったため、
-# 物理レート包絡(=RATE_LIMIT×cmd_gain)を旧設定と同等に保つよう引き上げた:
-#   旧 physical_max = (0.4·2.44, 0.4·2.46, 0.1·2.18) ≈ (0.98, 0.98, 0.22) rad/s
-#   新 physical_max = (1.0·1.0, 1.0·1.0, 0.25·0.89) ≈ (1.00, 1.00, 0.22) rad/s
-# ※ここを (0.4,0.4,0.1) のままにすると機体が旧比 ~2.5倍鈍る。控えめにしたい場合は要調整。
-RATE_LIMITS = (1.0, 1.0, 0.25)
+# --- 推力・レートのアクションマッピング(env側。ネットは常に[-1,1]^4)。config.yaml: action ---
+# thrust はホバー(0.2694)中心の対称帯 [0.2388,0.30](a3=0でホバー、+1で上昇/-1で下降)。
+# スタートのピン解除は別途 client.py が takeoff_thrust(0.265)を出す。詳細は config.yaml。
+HOVER_THRUST = uc("action", "hover_thrust", 0.2742)      # A==g 参考値
+TAKEOFF_THRUST = uc("action", "takeoff_thrust", 0.265)   # 離陸/ピン解除の閾値=スタート出力
+THRUST_CENTER = uc("action", "thrust_center", 0.2694)    # = ホバー
+THRUST_HALFSPAN = uc("action", "thrust_halfspan", 0.0306)  # → thrust ∈ [0.2388, 0.30]
+RATE_LIMITS = uc("action", "rate_limits", (1.0, 1.0, 1.0))  # roll/pitch/yaw 指令上限 [rad/s]
 
 
 @dataclass(frozen=True)
