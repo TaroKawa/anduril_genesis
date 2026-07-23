@@ -24,7 +24,7 @@ from .course import (
     GATE_DEPTH,
     GATE_INNER,
     GATE_OUTER,
-    floor_line_segments,
+    path_segments,
 )
 
 
@@ -238,35 +238,46 @@ class SceneBuilder:
             self.glow_entities.append(glow)
 
     def _add_ribbon(self, scene, gs):
-        """青パス=床面のシアン・レーンライン(2本)を区間ごとに個別エンティティで追加。
+        """青パス=ゲート内側(中心より下)を貫く帯(半透明フィル＋細い縁レール2本)。
 
-        実映像の青パスは空中リボンではなく床のガイドライン(ゲートへ収束する2本)なので、
-        床投影の twin-line メッシュ(course.floor_line_segments)で描画する。空中リボンは
-        実機に存在しない手掛かりになり sim-to-sim を悪化させるため廃止した。
-        非固定+gravity_compensation=1.0 で per-env に set_pos し、表示(原点)/非表示
-        (床下-80m)を切り替える機構(genesis_race_env._update_ribbon)はそのまま流用。
-        self.ribbon_entities[i] = ゲートi+1へ向かう区間(並びは従来と一致)。
+        実映像の青パスは床でも空中リボンでもなく、ゲート開口の内側下寄りを通り次ゲートへ
+        続く3Dパス。course.path_segments が区間毎に (fill, rails) を返すので、
+          - fill  : rail間を埋める薄い帯 → 半透明・淡発光(ribbon_entities)
+          - rails : ±rail_half の細い2本 → 明るい発光(ribbon_rail_entities)
+        の2エンティティを積む。どちらも非固定+gravity_compensation=1.0 で、表示/非表示は
+        genesis_race_env._update_ribbon が ribbon_entities と ribbon_rail_entities を同期
+        移動して切り替える(区間並びは従来と一致)。
+        self.ribbon_entities[i] = ゲートi+1へ向かう区間のフィル。
         """
         import trimesh
 
-        self.ribbon_entities = []
-        r, g, b = self.colors.ribbon_rgb
-        for verts_ned, faces in floor_line_segments(self.course):
+        def _mesh_entity(verts_ned, faces, surface):
             verts_w = verts_ned.copy()
             verts_w[:, 1] *= -1.0
             verts_w[:, 2] *= -1.0
             mesh = trimesh.Trimesh(vertices=verts_w, faces=faces, process=False)
-            f = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
-            mesh.export(f.name)
-            # 床ラインは実映像同様に明るく見せる(半透明を薄めて発光を強調)
-            ent = scene.add_entity(
-                gs.morphs.Mesh(file=f.name, fixed=False, collision=False,
+            fh = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+            mesh.export(fh.name)
+            return scene.add_entity(
+                gs.morphs.Mesh(file=fh.name, fixed=False, collision=False,
                                decimate=False, convexify=False),
                 material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                surface=gs.surfaces.Rough(color=(r * 0.2, g * 0.2, b * 0.2),
-                                          emissive=(r, g, b), opacity=0.9),
+                surface=surface,
             )
-            self.ribbon_entities.append(ent)
+
+        self.ribbon_entities = []
+        self.ribbon_rail_entities = []
+        r, g, b = self.colors.ribbon_rgb
+        for (fv, ff), (rv, rf) in path_segments(self.course):
+            # フィル: 半透明・淡発光(レール間を埋める)
+            fill = _mesh_entity(fv, ff, gs.surfaces.Rough(
+                color=(r * 0.15, g * 0.15, b * 0.15),
+                emissive=(r * 0.5, g * 0.5, b * 0.5), opacity=0.3))
+            # レール: 細く明るい縁
+            rail = _mesh_entity(rv, rf, gs.surfaces.Rough(
+                color=(r * 0.2, g * 0.2, b * 0.2), emissive=(r, g, b), opacity=0.95))
+            self.ribbon_entities.append(fill)
+            self.ribbon_rail_entities.append(rail)
 
     def _add_clutter(self, scene, gs):
         """駐機機体シルエット(箱の組合せ、暗灰色)。リボンから離れた床に配置。"""

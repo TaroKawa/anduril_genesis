@@ -410,11 +410,13 @@ class GenesisRaceEnv:
         との差分がある(区間×env)だけ書く。ビルド直後は全区間homeにある(=表示)。
         """
         ents = getattr(self.builder, "ribbon_entities", [])
+        rails = getattr(self.builder, "ribbon_rail_entities", [])
         if not ents or len(envs_idx) == 0:
             return
         if not hasattr(self, "_ribbon_home"):
             # build直後の基準位置をキャプチャ(メッシュ再センタリングに依存しないため)
             self._ribbon_home = [ent.get_pos()[0].clone() for ent in ents]
+            self._ribbon_rail_home = [e.get_pos()[0].clone() for e in rails]
             self._blink_on = torch.ones(len(ents), device=self.device, dtype=torch.bool)
             self._ribbon_vis = torch.ones(self.num_envs, len(ents),
                                           device=self.device, dtype=torch.bool)
@@ -434,8 +436,12 @@ class GenesisRaceEnv:
             idx = envs_idx[d]
             vis = vis_all[d, k]
             home = self._ribbon_home[k].expand(len(idx), 3)
-            ents[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
-                            envs_idx=idx, zero_velocity=True, relative=False)
+            pos = torch.where(vis.unsqueeze(1), home, home + sink)
+            ents[k].set_pos(pos, envs_idx=idx, zero_velocity=True, relative=False)
+            if k < len(rails):   # 縁レールもフィルと同期して表示/非表示
+                rail_home = self._ribbon_rail_home[k].expand(len(idx), 3)
+                rails[k].set_pos(torch.where(vis.unsqueeze(1), rail_home, rail_home + sink),
+                                 envs_idx=idx, zero_velocity=True, relative=False)
             self._ribbon_vis[idx, k] = vis
 
     def _tick_blink(self):
