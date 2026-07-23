@@ -8,3 +8,4 @@ checkpoints/
 checkpoints_old_resnet/
 *.pth
 runs
+checkpoints_old_mirror_signs/

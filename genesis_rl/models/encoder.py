@@ -23,12 +23,37 @@ class FrozenDINOv2(nn.Module):
 
     def __init__(self, bf16: bool = True):
         super().__init__()
-        self.net = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        self.net = self._load_hub()
         self.bf16 = bf16
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         self.requires_grad_(False)
         self.net.eval()
+
+    @staticmethod
+    def _load_hub():
+        """torch.hubのGitHub API検証(_validate_not_a_forked_repo)はレート制限(403)で
+        落ちることがあるため常にskip_validation。キャッシュ済みならsource="local"で
+        ネットワークを一切使わずロードする(torch-cacheボリュームに永続化される)。
+
+        複数collectorが同時に初回ロードするとzip展開が競合する(展開途中に他プロセスの
+        renameで展開先が消えFileNotFoundError)ため、flockで直列化する。"""
+        import fcntl
+        import os
+
+        repo, model = "facebookresearch/dinov2", "dinov2_vits14"
+        hub_dir = torch.hub.get_dir()
+        local = os.path.join(hub_dir, "facebookresearch_dinov2_main")
+        os.makedirs(hub_dir, exist_ok=True)
+        with open(os.path.join(hub_dir, ".dinov2.lock"), "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)   # withを抜ける(close)と自動解放
+            if os.path.isdir(local):
+                try:
+                    return torch.hub.load(local, model, source="local")
+                except Exception as e:
+                    print(f"[encoder] local hub load failed ({e}); falling back to github",
+                          flush=True)
+            return torch.hub.load(repo, model, skip_validation=True, trust_repo=True)
 
     def train(self, mode: bool = True):
         super().train(mode)
