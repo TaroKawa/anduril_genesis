@@ -69,7 +69,12 @@ HOVER_THRUST = 0.2742           # sysid: A==g となる指令推力
 TAKEOFF_THRUST = 0.265          # これ未満では離陸できない(A(0.265)=9.16 < g)
 THRUST_CENTER = 0.3325          # レンジ [0.265, 0.40] の中心
 THRUST_HALFSPAN = 0.0675
-RATE_LIMITS = (0.4, 0.4, 0.1)   # roll, pitch, yaw [rad/s](ユーザー確認済みの控えめ設定)
+# roll, pitch, yaw [rad/s]。【bit16採用で更新 2026-07-23】cmd_gain が 2.5→~1.0 になったため、
+# 物理レート包絡(=RATE_LIMIT×cmd_gain)を旧設定と同等に保つよう引き上げた:
+#   旧 physical_max = (0.4·2.44, 0.4·2.46, 0.1·2.18) ≈ (0.98, 0.98, 0.22) rad/s
+#   新 physical_max = (1.0·1.0, 1.0·1.0, 0.25·0.89) ≈ (1.00, 1.00, 0.22) rad/s
+# ※ここを (0.4,0.4,0.1) のままにすると機体が旧比 ~2.5倍鈍る。控えめにしたい場合は要調整。
+RATE_LIMITS = (1.0, 1.0, 0.25)
 
 
 @dataclass(frozen=True)
