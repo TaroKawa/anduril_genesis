@@ -85,7 +85,8 @@ class GenesisRaceEnv:
         rng = np.random.default_rng(seed + 777)
         backend = resolve_backend(cfg.render.backend)
         self.rig = CameraRig(backend, self.num_envs, cfg.render.width, cfg.render.height, self.device,
-                             max_seq_envs=cfg.render.max_seq_envs)
+                             max_seq_envs=cfg.render.max_seq_envs,
+                             exposure=float(getattr(cfg.render, "exposure", 1.0)))
 
         renderer = None
         vis_kwargs = {}
@@ -100,11 +101,13 @@ class GenesisRaceEnv:
         # 屋内シーン。ポイントライトは8192^2キューブシャドウマップを確保しVRAMを食い潰す
         # ため使わない。天井スラブは非表示(衝突のみ)にして平行光を屋内に届かせる
         # (実映像の天井も「黒地に発光ストリップ」なので見た目は一致する)。
+        # 実飛行フレームの実測(黒地に発光要素のみ、暗部42%・明部10%)に合わせ平行光は弱く。
+        # 非発光面はより黒く沈め(実機の中間灰は少ない)、明るさは発光面(リボン/灯/ゲート)が担う。
         lights = [
             {"type": "directional", "dir": (-0.3, -0.4, -1.0), "color": (1.0, 1.0, 1.0),
-             "intensity": float(rng.uniform(2.5, 4.5))},
+             "intensity": float(rng.uniform(0.15, 0.45))},
             {"type": "directional", "dir": (0.5, 0.3, -1.0), "color": (0.9, 0.9, 1.0),
-             "intensity": float(rng.uniform(1.0, 2.5))},
+             "intensity": float(rng.uniform(0.07, 0.25))},
         ]
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=C.DT_PHYS, substeps=1),
@@ -113,6 +116,7 @@ class GenesisRaceEnv:
             vis_options=gs.options.VisOptions(
                 rendered_envs_idx=rendered_idx,
                 ambient_light=(amb.colors.ambient,) * 3,
+                background_color=(0.0, 0.0, 0.0),   # 実機は黒背景(既定の紺色だと露出増感で青モヤになる)
                 lights=lights,
                 **vis_kwargs,
             ),
@@ -560,15 +564,18 @@ class GenesisRaceEnv:
             self._update_ribbon(self._all_idx, segments=changed.tolist())
 
     def _update_glow(self, envs_idx: torch.Tensor):
-        """床の金色グローは「次に行くべきゲート」1つだけ点灯する。
+        """床の金色グロー+光柱は「次に行くべきゲート」1つだけ点灯する。
 
         _update_ribbonと同様、前回書いた状態(_glow_vis)との差分だけset_posする。
+        glow_col_entities(光柱)は glow_entities(床帯)と同じ可視状態で同期移動する。
         """
         glows = getattr(self.builder, "glow_entities", [])
+        cols = getattr(self.builder, "glow_col_entities", [])
         if not glows or len(envs_idx) == 0:
             return
         if not hasattr(self, "_glow_home"):
             self._glow_home = [g.get_pos()[0].clone() for g in glows]
+            self._glow_col_home = [g.get_pos()[0].clone() for g in cols]
             self._glow_vis = torch.ones(self.num_envs, len(glows),
                                         device=self.device, dtype=torch.bool)
         active = self.active_gate[envs_idx]
@@ -583,6 +590,10 @@ class GenesisRaceEnv:
             home = self._glow_home[k].expand(len(idx), 3)
             glows[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
                              envs_idx=idx, zero_velocity=True, relative=False)
+            if k < len(cols):
+                col_home = self._glow_col_home[k].expand(len(idx), 3)
+                cols[k].set_pos(torch.where(vis.unsqueeze(1), col_home, col_home + sink),
+                                envs_idx=idx, zero_velocity=True, relative=False)
             self._glow_vis[idx, k] = vis
 
     def _apply_photo_dr(self, rgb_u8: torch.Tensor) -> torch.Tensor:

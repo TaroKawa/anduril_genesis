@@ -276,16 +276,65 @@ def _postprocess(pred: torch.Tensor, num_classes: int, conf_thre: float, nms_thr
 
 # ============================================================ detector
 
+# ゲート色検証(andu_ddrnet tools/infer_video.py の orange_ratio と同方式)。
+# 検出ボックス内のゲート色画素割合が GATE_ORANGE_THR 未満なら誤検出として捨てる。
+# 参照色は2色: 公式オレンジ #FA3C0F(andu_ddrnetの値)+ 実飛行フレーム実測のピンク寄り赤
+# (RGB 235,100,95。現行シムのゲートはブルームでピンク化しており、公式色だけだと本物の
+#  ゲートまで弾く: runs/20260720_212416 の frame_000050 で ratio 0.08 < 0.2 だった)。
+# 判定は両参照色の max(どちらかに20%以上合えばゲート)。シアンのリボン等の誤検出
+# (Lab a<0)はどちらの参照からも遠く、正しく除外される(同 frame_000190 で実測)。
+GATE_COLORS_BGR = ((15, 60, 250), (95, 100, 235))
+ORANGE_AB_TOL = 28               # Lab色度(a,b)距離のしきい値(明るさ変化に頑健)
+GATE_ORANGE_THR = 0.2
+
+_GATE_ABS: list | None = None
+
+
+def _gate_abs():
+    import cv2
+
+    global _GATE_ABS
+    if _GATE_ABS is None:
+        _GATE_ABS = [cv2.cvtColor(np.array([[c]], dtype=np.uint8),
+                                  cv2.COLOR_BGR2LAB)[0, 0, 1:].astype(np.int16)
+                     for c in GATE_COLORS_BGR]
+    return _GATE_ABS
+
+
+def orange_ratio(frame_bgr: np.ndarray, box) -> float:
+    """検出ボックス内のゲート色画素の割合(0-1、参照色ごとのmax)。"""
+    import cv2
+
+    h, w = frame_bgr.shape[:2]
+    x1, y1 = max(0, int(box[0])), max(0, int(box[1]))
+    x2, y2 = min(w, int(box[2])), min(h, int(box[3]))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return 0.0
+    lab = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2LAB).astype(np.int16)
+    best = 0.0
+    for ab in _gate_abs():
+        da = lab[:, :, 1] - int(ab[0])
+        db = lab[:, :, 2] - int(ab[1])
+        dist = np.sqrt((da * da + db * db).astype(np.float32))
+        best = max(best, float(np.count_nonzero(dist <= ORANGE_AB_TOL)) / float(dist.size))
+    return best
+
+
 class GateYOLOX:
     """YOLOX-x でゲートを検出し、HSV 版と同一契約の dict を返す。
 
-    重い推論のため VideoRX の受信スレッドで生成・実行される想定。
+    しきい値・選択ロジックは実飛行で使っている andu_ddrnet のパイプライン
+    (tools/infer_video.py: conf 0.5 / NMS 0.45 / min_area 1500px² /
+     面積最大の1個のみ採用 / オレンジ画素率>=0.2 で誤検出除去)と同一に揃える。
+    重い推論のため VideoRX の処理スレッドで生成・実行される想定。
     """
 
     def __init__(self, ckpt_path: str, device: torch.device,
                  num_classes: int = 1, input_size: tuple[int, int] = (640, 640),
-                 conf_thre: float = 0.30, nms_thre: float = 0.45,
-                 fp16: bool | None = None, gate_area_max: float | None = None):
+                 conf_thre: float = 0.5, nms_thre: float = 0.45,
+                 fp16: bool | None = None, gate_area_max: float | None = None,
+                 min_area: float = 1500.0, max_side: float = 30000.0,
+                 orange_thr: float = GATE_ORANGE_THR):
         from ..contracts import GATE_AREA_MAX
 
         self.device = device
@@ -293,6 +342,9 @@ class GateYOLOX:
         self.conf_thre = conf_thre
         self.nms_thre = nms_thre
         self.num_classes = num_classes
+        self.min_area = float(min_area)
+        self.max_side = float(max_side)
+        self.orange_thr = float(orange_thr)
         # rel_dist = 1 - bbox面積/gate_area_max。実bboxはGenesis投影(s_px²)より小さいため
         # 較正が必要(overrideで下げると接近時にrel_distが早く下がる)。既定は契約値。
         self.gate_area_max = float(GATE_AREA_MAX if gate_area_max is None else gate_area_max)
@@ -326,12 +378,35 @@ class GateYOLOX:
                 res["score"] = 0.0
             return res
 
-        # 最良スコア(obj*cls)の1個を採用 = 通常は最も近い/確からしいゲート
-        i = int(torch.argmax(dets[:, 4] * dets[:, 5]))
-        best = dets[i].cpu().numpy()
-        x1, y1, x2, y2 = best[:4] / r          # 元画像(640x360)座標へ戻す
-        x1 = float(np.clip(x1, 0, W)); x2 = float(np.clip(x2, 0, W))
-        y1 = float(np.clip(y1, 0, H)); y2 = float(np.clip(y2, 0, H))
+        # andu_ddrnet と同一の後処理: 元画像座標へ戻し min_area/max_side でフィルタ →
+        # 面積最大の1個だけ採用 → ボックス内オレンジ率で本物のゲートか検証
+        d = dets.cpu().numpy()
+        boxes = d[:, :4] / r
+        boxes[:, 0::2] = boxes[:, 0::2].clip(0, W)
+        boxes[:, 1::2] = boxes[:, 1::2].clip(0, H)
+        bw = boxes[:, 2] - boxes[:, 0]
+        bh = boxes[:, 3] - boxes[:, 1]
+        keep = np.ones(len(d), dtype=bool)
+        if self.min_area > 0:
+            keep &= (bw * bh) >= self.min_area
+        if self.max_side > 0:
+            keep &= np.maximum(bw, bh) <= self.max_side
+        if not keep.any():
+            res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
+            if return_box:
+                res["box"] = None
+                res["score"] = 0.0
+            return res
+        idx = np.where(keep)[0]
+        i = int(idx[np.argmax((bw * bh)[idx])])          # 面積最大の1個
+        best = d[i]
+        x1, y1, x2, y2 = (float(v) for v in boxes[i])
+        if self.orange_thr > 0 and orange_ratio(img_bgr, (x1, y1, x2, y2)) < self.orange_thr:
+            res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
+            if return_box:
+                res["box"] = (x1, y1, x2, y2)
+                res["score"] = float(best[4] * best[5])
+            return res
         # 至近でゲート枠が画面からはみ出すと bbox がフレームへクリップされ、bbox中心が
         # 「ほぼ整列」という偽信号になる(実際はズレていても)。学習側 SimGateDetector の
         # 契約では投影中心が画面外に出た時点で不可視。bboxが画面端の3辺以上に達している=

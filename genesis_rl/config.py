@@ -30,6 +30,11 @@ class RenderConfig:
     height: int = 180
     jpeg_dr: bool = False         # JPEG劣化DR(逐次モードのみ推奨)
     max_seq_envs: int = 16        # sequentialバックエンドの実レンダenv数上限(per collector)
+    # 露出ゲイン(レンダ直後に乗算・飽和)。ラスタライザは発光面でも指定色よりずっと暗く
+    # 描画し(Emission(1,1,1)でも~141、ゲート赤は~102)、実DCL映像の白飛びするネオン
+    # (シアンレール max(252,255,255)・ゲート max(255,180,183))に届かない。
+    # 2.6で発光面の芯が飽和し実機の輝度レンジに一致する(実測較正 2026-07-25)。
+    exposure: float = 2.6
     # 測光ドメインランダム化の強さ(0=無効)。per-envのゲイン/ガンマ/コントラスト/ノイズを
     # エピソードごとに再サンプルしてレンダフレームへ適用する。レンダ実装(Madrona/EGLラスタ/
     # ホストGL/実シムDCL)間の色応答・露出差に対する方策の視覚頑健化が目的(sim2sim転移で必須。
@@ -54,7 +59,7 @@ class DroneConfig:
     rate_max: float = uc("dynamics", "rate_max", 4.0)       # 内部レート目標クランプ [rad/s]
     # DR倍率レンジ(エピソードごと)。config.yaml: domain_rand
     dr_mass: tuple = uc("domain_rand", "mass", (0.9, 1.1))
-    dr_k_rate: tuple = uc("domain_rand", "k_rate", (0.6, 1.6))
+    dr_k_rate: tuple = uc("domain_rand", "k_rate", (0.8, 1.2))
     dr_cmd_gain: tuple = uc("domain_rand", "cmd_gain", (0.95, 1.05))
     dr_drag: tuple = uc("domain_rand", "drag", (0.85, 1.15))
     dr_hover: tuple = uc("domain_rand", "hover", (0.98, 1.02))

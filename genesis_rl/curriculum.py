@@ -7,11 +7,13 @@
 | 2     | 緩カーブ(標準間隔)| 4ゲート     | x0.6   | 0.3              | -    | -        | -            | x1.0     |
 | 3     | フル生成          | 全18        | x1.0   | 0                | o    | -        | -            | x1.0     |
 | 4     | 32シードプール    | 全18        | x1.0   | 0.3              | o    | o        | -            | x1.0     |
-| 5     | 同上(sim2sim堅牢化)| 全18       | x1.5   | 0.3              | o    | o        | -(廃止)     | x1.5     |
+| 5     | 同上(sim2sim堅牢化)| 全18       | x1.0   | 0.3              | o    | o        | -(廃止)     | x1.0     |
 
 Stage 5 は「実シミュレータ(DCL本番シム)への汎化」を狙う最終堅牢化ステージ。速度ボーナスは
-廃止し、代わりにノイズ(IMU/検出)と動力学DR(質量/レート/ドラッグ/ホバー/慣性…)のレンジを
-拡大して、sim2sim ギャップに耐える方策へ仕上げる(色DR・クラッタは継続)。
+廃止し、視覚DR(photo_dr/色DR/クラッタ)でsim2simギャップに耐える方策へ仕上げる。
+非視覚ノイズ・動力学DRは較正値のまま(x1.0): デプロイ実測(2026-07)で動力学・レート追従
+(0.97/0.97/0.89)・映像遅延は較正どおり一致し、残るギャップは映像の見た目のみと判明した。
+固有受容を実際よりノイジーに見せると方策が視覚依存を強めて逆効果のため、旧x1.5は廃止。
 
 Stage 1(近接緩カーブ)は直線→標準カーブの間の中間難度: ゲート間隔を5-8mに
 詰め、通過直後に次ゲートが視界に入る=報酬までの距離が短い状態でカーブ操作を学ぶ。
@@ -41,7 +43,7 @@ class StageSpec:
     color_dr: bool
     clutter: bool
     speed_finish_w: float
-    dr_scale: float = 1.0  # 動力学DRレンジの拡大係数(stage5でsim2sim堅牢化のため>1)
+    dr_scale: float = 1.0  # 動力学DRレンジの拡大係数(現在は全ステージx1.0=較正レンジのまま)
 
 
 STAGES = [
@@ -50,10 +52,13 @@ STAGES = [
     StageSpec(2, 4, 0.6, 0.3, False, False, 0.0),
     StageSpec(3, 18, 1.0, 0.0, True, False, 0.0),
     StageSpec(3, 18, 1.0, 0.3, True, True, 0.0),
-    # Stage5: 速度ボーナス廃止 → 実シミュレータ汎化のためノイズ&動力学DRを拡大。
+    # Stage5: 速度ボーナス廃止 → 実シミュレータ汎化ステージ。ノイズ・動力学DRは較正値の
+    # まま(x1.0)。デプロイ実測で動力学・レート追従・遅延は較正どおり一致しており、残る
+    # sim2simギャップは映像の見た目のみと判明したため、非視覚ノイズの拡大(旧x1.5)は廃止。
+    # ランダム化はphoto_dr(測光DR)・色DR・クラッタなど視覚側に集中させる。
     # 途中スポーン(resume)は使わず初期位置スタートのみ(resume_prob=0)。コース多様化は
     # per-env(各envに別コース)で行い、6000エピソード再構築には頼らない。
-    StageSpec(3, 18, 1.5, 0.0, True, True, 0.0, dr_scale=1.5),
+    StageSpec(3, 18, 1.0, 0.0, True, True, 0.0, dr_scale=1.0),
 ]
 
 # 最終ステージ(=per-envコース/初期位置スタート/再構築なし)のindex
@@ -67,6 +72,9 @@ class CurriculumManager:
         self.results = deque(maxlen=cfg.window)
         self.episodes_since_rebuild = 0
         self.seed_counter = 0
+        # per-envコースが実際に有効か(collectorが設定)。stage5でも env.per_env_courses=false
+        # なら従来のシーン再構築でコースを回す(リボン/柱/クラッタ等のフルビジュアル維持)。
+        self.per_env_active = False
 
     @property
     def spec(self) -> StageSpec:
@@ -113,8 +121,9 @@ class CurriculumManager:
         return False
 
     def needs_rebuild(self) -> bool:
-        # 最終ステージはper-envで多様なコースを常時適用するため定期再構築しない
-        if self.stage >= PER_ENV_STAGE:
+        # per-envコース有効時は多様なコースを常時適用するため定期再構築しない。
+        # (per-env無効の最終ステージは従来どおり再構築でコースを回す)
+        if self.per_env_active:
             return False
         return self.episodes_since_rebuild >= self.cfg.rebuild_episodes
 

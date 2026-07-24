@@ -56,6 +56,7 @@ class Collector:
                                   stage=spec.course_stage,
                                   rng_seed=course_seed + 100_003 * rank)
         self.curriculum = CurriculumManager(cfg.curriculum, start_stage=stage)
+        self.curriculum.per_env_active = bool(env_cfg.per_env_courses)
         # collectorはプロセス再起動で作り直されるため、シード連番を現seedから復元する
         # (これがないとnext_course_seedが毎回base+1を返し、同一コースを再構築し続ける)
         self.curriculum.seed_counter = max(0, course_seed - cfg.env.course_seed)

@@ -8,7 +8,9 @@ env:
   n_gates: 18
   course_seed: 0
   stage: 0              # カリキュラムが自動進級(curriculum.enabled: true)
-  per_env_courses: true # stage5で各envに別コースを割当(多様なコースを最初から/再構築なし/初期位置スタート)
+  per_env_courses: false # per-env時はリボン/柱/クラッタ/床グローが省かれ、実シム(常にリボン等が
+                         # 映る)との視覚ギャップ源になるためsim2sim段階では無効化。コース多様化は
+                         # 従来のシーン再構築(rebuild_episodes毎、stage4+はseed_poolを循環)で行う
   course_pool: 512      # per-env時のコース種類数(0=envごとにユニーク=num_envs種)
   render:
     backend: batch      # gs_madrona(genesis依存に同梱)。ネイティブLinuxで有効

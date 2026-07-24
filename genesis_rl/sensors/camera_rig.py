@@ -65,12 +65,16 @@ class CameraRig:
     """env用FPVカメラ。add_cameras()はscene.build()前、attach()はbuild後に呼ぶ。"""
 
     def __init__(self, backend: str, num_envs: int, width: int, height: int, device: torch.device,
-                 max_seq_envs: int = 16):
+                 max_seq_envs: int = 16, exposure: float = 1.0):
         self.backend = backend
         self.num_envs = num_envs
         self.w, self.h = width, height
         self.device = device
         self.cam = None
+        # 露出ゲイン: ラスタライザは発光(1,1,1)面でも最大~141までしか出さず(実測)、
+        # 実DCL映像の「白飛びするブルーム」(明部V>=120が画素の10%)に届かない。
+        # レンダ直後に乗算して飽和させ、実カメラの露出特性を近似する。
+        self.exposure = float(exposure)
         # sequentialでは全envのレンダは高価なので上限を設ける(それ以外のenvはrgbゼロ)
         self.n_rendered = num_envs if backend == "batch" else min(num_envs, max_seq_envs)
         if backend == "none":
@@ -98,5 +102,8 @@ class CameraRig:
         if rgb.ndim == 3:
             rgb = rgb.unsqueeze(0)
         n = min(rgb.shape[0], self.num_envs)
-        out[:n] = rgb[:n, :, :, :3].to(self.device, dtype=torch.uint8)
+        frames = rgb[:n, :, :, :3].to(self.device)
+        if self.exposure != 1.0:
+            frames = (frames.float() * self.exposure).clamp(0.0, 255.0)
+        out[:n] = frames.to(torch.uint8)
         return out
