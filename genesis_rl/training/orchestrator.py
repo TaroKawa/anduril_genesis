@@ -63,6 +63,26 @@ def _to_cpu(batch: dict) -> dict:
     return {k: v.detach().to("cpu", non_blocking=False) for k, v in batch.items()}
 
 
+def _put_interruptible(q, item, *evs, timeout: float = 0.5) -> bool:
+    """Queueが満杯でも無限ブロックしない put。stop/rebuild イベントが立ったら item を
+    捨てて False を返す(呼び出し側はクリーンに break して終了する)。
+
+    ブロッキング put を避けることが要点: カリキュラム再構築で collector を terminate() した際、
+    その collector が共有 mp.Queue の内部ロックを保持したまま殺されるとロックが orphan 化し、
+    再起動後の全 collector が put で永久ブロック(futex_wait)してデッドロックする。putを
+    中断可能にして「必ず自主終了(exit 3)」させることで terminate() 自体を不要にし、これを防ぐ。
+    """
+    import queue as pyqueue
+
+    while True:
+        try:
+            q.put(item, timeout=timeout)
+            return True
+        except pyqueue.Full:
+            if any(e is not None and e.is_set() for e in evs):
+                return False
+
+
 def _curriculum_path(cfg) -> Path:
     return Path(cfg.run.ckpt_dir) / "curriculum.json"
 
@@ -178,8 +198,8 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
     collector = Collector(cfg, device, stage, seed, rank=rank)
     collector.transitions = transitions0
     collector.warmup()
-    q_metrics.put({"type": "info", "msg": f"collector{rank} up: stage={stage} seed={seed} "
-                                          f"envs={collector.N} backend={collector.env.rig.backend}"})
+    _put_interruptible(q_metrics, {"type": "info", "msg": f"collector{rank} up: stage={stage} "
+                       f"seed={seed} envs={collector.N} backend={collector.env.rig.backend}"}, stop_ev)
     next_eval = collector.transitions + cfg.run.eval_interval
     eval_frames = []
     eval_left = 0
@@ -201,14 +221,24 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
             eval_left = int(20 * C.POLICY_HZ)
             next_eval += cfg.run.eval_interval
 
+        aborted = False
         if matured is not None:
             with collector.prof.section("queue_put"):
-                q_trans.put(("main", _to_cpu(matured)))
-        if succ is not None:
+                aborted = not _put_interruptible(q_trans, ("main", _to_cpu(matured)),
+                                                 stop_ev, rebuild_ev)
+        if not aborted and succ is not None:
             with collector.prof.section("queue_put"):
-                q_trans.put(("succ", _to_cpu(succ)))
-        for info in ep_infos:
-            q_metrics.put({"type": "episode", "transitions": collector.transitions, "info": info})
+                aborted = not _put_interruptible(q_trans, ("succ", _to_cpu(succ)),
+                                                 stop_ev, rebuild_ev)
+        if not aborted:
+            for info in ep_infos:
+                if not _put_interruptible(q_metrics,
+                                          {"type": "episode", "transitions": collector.transitions,
+                                           "info": info}, stop_ev, rebuild_ev):
+                    aborted = True
+                    break
+        if aborted:  # stop/rebuild が立った → ロックを持ったまま殺されないうちにクリーン終了
+            break
 
         # 最新のactor重みへ(latest-only)
         sd = None
@@ -222,7 +252,7 @@ def collector_main(cfg, gpu_index: int, stage: int, seed: int, transitions0: int
 
         ev = collector.maybe_curriculum()
         if ev is not None:  # rank0のみ(他rankはNone固定)
-            q_metrics.put({"type": "curriculum", **ev})
+            _put_interruptible(q_metrics, {"type": "curriculum", **ev}, stop_ev)
             _curriculum_path(cfg).write_text(json.dumps(
                 {"stage": ev["stage"], "seed": ev["seed"], "transitions": collector.transitions}))
             if rebuild_ev is not None:
@@ -247,7 +277,7 @@ def _save_eval_video(cfg, frames, transitions):
 
 
 def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_list, q_metrics,
-                 stop_ev):
+                 stop_ev, progress=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import queue as pyqueue
 
@@ -314,6 +344,10 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_lis
         except pyqueue.Empty:
             pass
 
+        # orchestratorのストール監視へ進捗を通知(遷移数が一定時間進まなければコンテナ再起動される)
+        if progress is not None:
+            progress.value = int(learner.transitions)
+
         now = time.time()
         if now - last_weights > cfg.sac.weight_sync_sec:
             sd = learner.actor_weights_cpu()
@@ -356,9 +390,11 @@ def run_async(cfg, resume: str | None = None):
     q_metrics = ctx.Queue(maxsize=2048)
     stop_ev = ctx.Event()
     rebuild_ev = ctx.Event()
+    progress = ctx.Value("q", 0)  # learnerの累積遷移数。ストール監視用
+    stall_timeout = float(os.environ.get("STALL_TIMEOUT_SEC", "600"))  # 進捗が止まってからコンテナ再起動するまで
 
     lp = ctx.Process(target=learner_main, name="learner",
-                     args=(cfg, lrn_idx, resume, q_trans, q_weights_list, q_metrics, stop_ev))
+                     args=(cfg, lrn_idx, resume, q_trans, q_weights_list, q_metrics, stop_ev, progress))
     lp.start()
 
     def _join_all(cps, timeout):
@@ -386,8 +422,25 @@ def run_async(cfg, resume: str | None = None):
                 cp.start()
                 if stagger > 0 and i < len(cps) - 1:
                     time.sleep(stagger)
+            # ストール監視: 遷移数(progress)がstall_timeout秒進まなければデッドロック等と判断し、
+            # 非0終了→restart:unless-stoppedでコンテナごと再起動(Queue作り直しで確実に復旧)。
+            wd_val, wd_t = progress.value, time.time()
+            stalled = False
             while lp.is_alive() and all(cp.is_alive() for cp in cps):
                 time.sleep(2.0)
+                v = progress.value
+                if v != wd_val:
+                    wd_val, wd_t = v, time.time()
+                elif v > 0 and time.time() - wd_t > stall_timeout:
+                    stalled = True
+                    break
+            if stalled:
+                print(f"[orchestrator] STALL: 遷移数が t={wd_val} で {stall_timeout:.0f}s 進みません — "
+                      "コンテナ再起動で復旧します(exit 42)")
+                stop_ev.set()
+                _join_all(cps, timeout=30)
+                exit_code = 42
+                break
             if not lp.is_alive():
                 if lp.exitcode == 0:
                     print("[orchestrator] learner finished (total_transitions reached)")
@@ -398,18 +451,24 @@ def run_async(cfg, resume: str | None = None):
                 stop_ev.set()
                 _join_all(cps, timeout=30)
                 break
-            # いずれかのcollectorが終了。rebuild(exit 3)なら全員を回収して再起動
+            # いずれかのcollectorが終了。共有mp.Queueを再構築をまたいで使い回すと、
+            # 協調終了(terminate)でキューの内部ロックがorphan化し再起動後の全collectorが
+            # futex_wait_queueでデッドロックする。よってプロセス内では再起動せず、
+            # orchestratorごと終了→restart:unless-stoppedでコンテナを丸ごと再起動し、
+            # 新stage(rank0がcurriculum.jsonへ記録済み)+latest.pt から再開する(堅牢設計)。
+            stop_ev.set()  # learnerにcheckpoint+終了を指示
             _join_all(cps, timeout=60 if rebuild_ev.is_set() else 10)
             codes = [cp.exitcode for cp in cps]
             if rebuild_ev.is_set() or 3 in codes:
-                print(f"[orchestrator] collector rebuild (codes={codes}) — "
-                      "restarting with new stage/seed")
-                continue
-            if 0 in codes:
+                print(f"[orchestrator] カリキュラム再構築 (codes={codes}) — "
+                      "exit 3 でコンテナ再起動 → 新stageで再開")
+                exit_code = 3
+            elif 0 in codes:
                 exit_code = 0
-                break
-            print(f"[orchestrator] collector died (codes={codes}) — restarting in 10s")
-            time.sleep(10.0)
+            else:
+                print(f"[orchestrator] collector 終了 (codes={codes}) — exit 1 でコンテナ再起動")
+                exit_code = 1
+            break
     finally:
         stop_ev.set()
         for p in (lp,):

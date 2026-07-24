@@ -22,6 +22,9 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYOPENGL_PLATFORM=egl
+      # 断片化緩和 + PyTorchキャッシュを積極解放(collectorでMadrona/quadrantsのcuMemAllocAsyncと
+      # 同一GPUを共有するため、PyTorchが抱え込むとレンダ側がOOMする。GC閾値0.8で高水位時に返却)
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
       # プロセス数(learner1+collector7=8)×スレッドで240コアを埋める。オーバーサブスクは避ける
       - OMP_NUM_THREADS=24
       - MKL_NUM_THREADS=24

@@ -55,6 +55,9 @@ class DroneModel:
         self.hover_mul = torch.ones(num_envs, 1, device=device)
         self.alpha_mul = torch.ones(num_envs, 1, device=device)
         self.inertia_mul = torch.ones(num_envs, 1, device=device)
+        # 動力学DRレンジの拡大係数(カリキュラム最終stageで>1にして実シミュレータ差を吸収)。
+        # 1.0=config.yaml domain_rand そのまま。set_stage_runtime(dr_scale=…)で更新。
+        self.dr_scale = 1.0
         # 直近の印加(IMU比力の解析計算に使う)
         self.last_specific_force_frd = torch.zeros(num_envs, 3, device=device)
 
@@ -62,8 +65,15 @@ class DroneModel:
         n = len(envs_idx)
         c = self.cfg
 
+        s = self.dr_scale
+
         def u(lo, hi):
-            return torch.rand(n, 1, device=self.device) * (hi - lo) + lo
+            # dr_scale>1 のとき、レンジを中心周りに拡大する(実シミュレータ差の吸収=堅牢化)。
+            # s=1.0 なら [lo,hi] そのまま(stage0-4は従来と厳密一致)。
+            mid = 0.5 * (lo + hi)
+            half = 0.5 * (hi - lo) * s
+            lo2, hi2 = mid - half, mid + half
+            return torch.rand(n, 1, device=self.device) * (hi2 - lo2) + lo2
 
         if dr:
             self.mass_mul[envs_idx] = u(*c.dr_mass)

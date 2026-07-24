@@ -131,6 +131,10 @@ class SacConfig:
     log_std_max: float = 2.0
     compile: bool = True
     encoder_bf16: bool = True
+    encoder_chunk: int = 512              # DINOv2 forwardの1回あたり最大画像数。全env一括だと
+                                          # (N,3,224,224)の巨大activationでcollector GPUが80GB上限に
+                                          # 達しcuMemAllocAsync OOM→クラッシュ。凍結エンコーダは
+                                          # サンプル独立なのでchunk分割しても出力は厳密一致。0で無効(一括)。
     total_transitions: int = 50_000_000
 
 

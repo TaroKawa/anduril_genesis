@@ -15,7 +15,7 @@ env:
 
 sac:
   batch_size: 2548         # learner専有A100を活かす。大量の新鮮データ向けに1024→2048
-  replay_capacity: 4000000 # GPU常駐replay(1遷移≈12KB → 約46GB@GPU0)
+  replay_capacity: 2500000 # GPU常駐replay(1遷移≈12KB → 約31GB@GPU0)。4M→2.5MでOOM回避(compile/CUDAで約24GB overheadがあり79GBに達していた)
   success_capacity: 500000 # RLPD成功バッファ(約6GB)
   n_step: 3
   success_ratio: 0.5
@@ -23,7 +23,11 @@ sac:
   learn_start: 20000
   replay_ratio_cap: 8.0     # learnerのUTD上限(=過学習防止)。7collectorのデータ律速では通常この下で回る
   weight_sync_sec: 1.0      # collectorへactor重みを配る間隔。2.0→1.0で方策の鮮度を上げ探索を改善
+  total_transitions: 500000000  # 学習予算(既定50M)。stage3→5まで学習を続けるため500Mに拡大
   compile: true
+  encoder_chunk: 384        # DINOv2 forwardを384枚ずつに分割(num_envs=1536を4分割)。全env一括だと
+                            # (N,3,224,224)の巨大activationでcollector GPUが80GB上限→OOMクラッシュ。
+                            # 凍結エンコーダはサンプル独立なので出力は一括と厳密一致(学習挙動は不変)。
 
 curriculum:
   enabled: true

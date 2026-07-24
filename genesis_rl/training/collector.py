@@ -60,9 +60,11 @@ class Collector:
         self.env.set_stage_runtime(noise_scale=spec.noise_scale,
                                    resume_prob=self.curriculum.resume_prob_now(),
                                    required_gates=min(spec.required_gates, self.env.n_gates - 1),
-                                   speed_finish_w=spec.speed_finish_w)
+                                   speed_finish_w=spec.speed_finish_w,
+                                   dr_scale=spec.dr_scale)
         self.N = self.env.num_envs
         self.encoder = FrozenDINOv2(bf16=cfg.sac.encoder_bf16).to(self.env.device).eval()
+        self.encoder_chunk = cfg.sac.encoder_chunk  # 一括forwardのピークメモリを抑えるchunk上限
         self._blank_feat = None  # ゼロ画像のエンコーダ特徴(定数)のキャッシュ
         self.actor = SACActor(hidden=cfg.sac.hidden).to(self.env.device).eval()
         self.nstep = NStepAssembler(self.N, cfg.sac.n_step, cfg.sac.gamma,
@@ -104,14 +106,27 @@ class Collector:
         """
         nz = rgb_u8.flatten(1).any(dim=1)
         if nz.all():
-            return self.encoder(C.to_resnet(rgb_u8))
+            return self._encode_all(rgb_u8)
         if self._blank_feat is None:
             blank = torch.zeros(1, *rgb_u8.shape[1:], dtype=rgb_u8.dtype, device=rgb_u8.device)
             self._blank_feat = self.encoder(C.to_resnet(blank))[0]
         out = self._blank_feat.expand(rgb_u8.shape[0], -1).clone()
         if nz.any():
-            out[nz] = self.encoder(C.to_resnet(rgb_u8[nz]))
+            out[nz] = self._encode_all(rgb_u8[nz])
         return out
+
+    def _encode_all(self, rgb_u8: torch.Tensor) -> torch.Tensor:
+        """全件をエンコード。encoder_chunk>0なら分割してピークメモリを抑える。
+
+        to_resnet(→(N,3,224,224) float)とDINOv2 activationはNに比例する巨大な一時テンソル。
+        全env(=num_envs)一括だとcollector GPUが80GB上限に達しOOMで落ちる。凍結エンコーダは
+        サンプル独立(LayerNorm/BNなし依存)なのでchunk分割しても出力は一括と厳密一致する。"""
+        chunk = self.encoder_chunk
+        n = rgb_u8.shape[0]
+        if chunk <= 0 or n <= chunk:
+            return self.encoder(C.to_resnet(rgb_u8))
+        parts = [self.encoder(C.to_resnet(rgb_u8[i:i + chunk])) for i in range(0, n, chunk)]
+        return torch.cat(parts, dim=0)
 
     def warmup(self):
         self._obs, self._priv = self.env.reset()

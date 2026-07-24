@@ -564,7 +564,8 @@ class GenesisRaceEnv:
         return obs, priv, closeness
 
     def set_stage_runtime(self, *, noise_scale: float | None = None, resume_prob: float | None = None,
-                          required_gates: int | None = None, speed_finish_w: float | None = None):
+                          required_gates: int | None = None, speed_finish_w: float | None = None,
+                          dr_scale: float | None = None):
         """再構築不要なステージ依存パラメータの更新。"""
         if noise_scale is not None:
             self.cfg.sensors.noise_scale = noise_scale
@@ -574,6 +575,8 @@ class GenesisRaceEnv:
             self.required_gates = required_gates
         if speed_finish_w is not None:
             self.rewards.w.speed_finish = speed_finish_w
+        if dr_scale is not None:
+            self.drone.dr_scale = dr_scale
 
     def close(self):
         # Genesisはシーン単位の破棄APIが限定的。プロセス内再構築はscene参照を捨てるだけで
