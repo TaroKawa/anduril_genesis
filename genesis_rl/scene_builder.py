@@ -92,24 +92,30 @@ class SceneBuilder:
     """1つのgs.Sceneに静的コースジオメトリ+ドローンを構築する。"""
 
     def __init__(self, course: CourseSpec, rng: np.random.Generator,
-                 color_dr: bool = False, clutter: bool = False):
+                 color_dr: bool = False, clutter: bool = False, per_env: bool = False):
         self.course = course
         self.rng = rng
         self.colors = sample_colors(rng, color_dr)
         self.clutter = clutter
+        # per_env: ゲートを非固定・衝突なしの表示専用ボックスにし、envごとにset_pos/set_quatで
+        # 別コースへ配置し直す(衝突は数値計算)。コース依存メッシュのリボン/柱/クラッタは省く。
+        self.per_env = per_env
         self.drone_entity = None
         self.static_entities = []
+        self.gate_bar_entities = []   # per_env時: (entity, gi, off_side, off_up) のリスト
 
     def build_scene(self, scene, drone_cfg):
         import genesis as gs
 
         self._add_hall(scene, gs)
-        self._add_pillars(scene, gs)
+        if not self.per_env:
+            self._add_pillars(scene, gs)
         self._add_ceiling_lights(scene, gs)
         self._add_gates(scene, gs)
-        self._add_ribbon(scene, gs)
-        if self.clutter:
-            self._add_clutter(scene, gs)
+        if not self.per_env:
+            self._add_ribbon(scene, gs)
+            if self.clutter:
+                self._add_clutter(scene, gs)
         self._add_drone(scene, gs, drone_cfg)
         return self.drone_entity
 
@@ -189,6 +195,9 @@ class SceneBuilder:
                     )
 
     def _add_gates(self, scene, gs):
+        if self.per_env:
+            self._add_gates_per_env(scene, gs)
+            return
         c = self.colors
         self.glow_entities = []
         for gi, gate in enumerate(self.course.gates):
@@ -236,6 +245,40 @@ class SceneBuilder:
                 surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
             )
             self.glow_entities.append(glow)
+
+    # ゲート4バーの面内オフセット(side,up)とサイズ(side,up)。全ゲート共通。
+    GATE_BARS = None  # 遅延初期化(モジュール定数から)
+
+    def _add_gates_per_env(self, scene, gs):
+        """per-envモード: ゲートを非固定・衝突なしの表示専用ボックスで作る。
+
+        ビルド時は course(=pool[0])の配置に置くが、genesis_race_env が build 後に
+        envごとに set_pos/set_quat で各envのコースへ移動する。衝突は数値計算に切替える
+        ため collision=False。gravity_compensation=1.0 で自由落下しない(リボン/グロー同様)。
+        """
+        c = self.colors
+        self.glow_entities = []
+        half = (GATE_INNER + BAR_W) / 2  # 1.05m
+        bars = [
+            (+half, 0.0, BAR_W, GATE_OUTER),
+            (-half, 0.0, BAR_W, GATE_OUTER),
+            (0.0, +half, GATE_INNER, BAR_W),
+            (0.0, -half, GATE_INNER, BAR_W),
+        ]
+        for gi, gate in enumerate(self.course.gates):
+            cw = np.array(ned2w(gate.center_ned))
+            R_w = rot_ned_to_world(gate.rotation_ned())
+            quat = np_R_to_quat(R_w)
+            for (off_side, off_up, size_side, size_up) in bars:
+                pos = cw + R_w @ np.array([0.0, off_side, off_up])
+                ent = scene.add_entity(
+                    gs.morphs.Box(pos=tuple(pos), quat=quat,
+                                  size=(GATE_DEPTH, size_side, size_up),
+                                  fixed=False, collision=False),
+                    material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                    surface=gs.surfaces.Emission(color=tuple(c.gate_rgb)),
+                )
+                self.gate_bar_entities.append((ent, gi, off_side, off_up))
 
     def _add_ribbon(self, scene, gs):
         """青パス=ゲート内側(中心より下)を貫く帯(半透明フィル＋細い縁レール2本)。

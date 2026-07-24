@@ -104,6 +104,12 @@ class EnvConfig:
     signs_accel: tuple = uc("signs", "accel", (1.0, 1.0, 1.0))
     color_dr: bool = False                # 色DR(シーン再構築ごと。カリキュラムStage2+で有効)
     clutter: bool = False                 # 駐機機体クラッタ(Stage3+)
+    # per-envコース: 各並列envに異なるゲート配置を割り当てる(stage>=5でのみ有効)。
+    # ゲートは非固定・表示専用ボックスとしてenvごとにset_pos/set_quatで配置し、
+    # 衝突はコードで数値計算(物理接触ではない)。リボン/柱/クラッタは非表示(=コース依存
+    # メッシュのため per-env 化不可)。6000エピソード再構築に頼らず多様なコースを最初から適用する。
+    per_env_courses: bool = False
+    course_pool: int = 0                  # per-env時のコース種類数。0=envごとにユニーク(num_envs種)
 
 
 @dataclass

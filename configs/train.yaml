@@ -3,10 +3,13 @@
 #   learner=GPU0(専有・巨大replay) / collector=GPU1..7(各1本、Madrona batchレンダ)
 #   コンシューマ2GPUに戻すには hw と env.num_envs / render.backend を元へ。
 env:
-  num_envs: 1536        # per collector。Madrona batchで全env一括GPUレンダ(GPUメモリ~55GB活用)
+  num_envs: 1536        # per collector。per-env化後の実測スイートスポット(2560に増やすと非固定
+                        # ゲート体×env数で物理/レンダが飽和し逆にスループット低下=978k→805k trans/min)
   n_gates: 18
   course_seed: 0
   stage: 0              # カリキュラムが自動進級(curriculum.enabled: true)
+  per_env_courses: true # stage5で各envに別コースを割当(多様なコースを最初から/再構築なし/初期位置スタート)
+  course_pool: 512      # per-env時のコース種類数(0=envごとにユニーク=num_envs種)
   render:
     backend: batch      # gs_madrona(genesis依存に同梱)。ネイティブLinuxで有効
     width: 320

@@ -18,7 +18,7 @@ import torch
 
 from .. import contracts as C
 from ..config import EnvConfig
-from ..course import CourseGenerator
+from ..course import GATE_DEPTH, GATE_INNER, GATE_OUTER, CourseGenerator
 from ..drone import DroneModel
 from ..frames import (
     ProductionSigns,
@@ -29,7 +29,7 @@ from ..frames import (
 )
 from ..latency import DelayQueue
 from ..rewards import RewardComputer, RewardWeights
-from ..scene_builder import SceneBuilder
+from ..scene_builder import SceneBuilder, ned2w, np_R_to_quat, rot_ned_to_world
 from ..sensors.camera_rig import CameraRig, resolve_backend
 from ..sensors.gate_detector import SimGateDetector
 from ..sensors.imu import ImuSim
@@ -73,18 +73,13 @@ class GenesisRaceEnv:
         self.action_map = C.ActionMap()
         self.signs = ProductionSigns(cfg.signs_cmd, cfg.signs_gyro, cfg.signs_accel)
 
-        # --- コース ---
-        self.course = CourseGenerator(seed=seed, stage=self.stage, n_gates=cfg.n_gates).generate()
-        self.n_gates = self.course.n_gates
-        gate_centers = np.stack([g.center_ned for g in self.course.gates])
-        gate_yaws = np.array([g.yaw for g in self.course.gates])
-        # ゲートは傾き(pitch/roll)を持つ → 面の3軸(法線・側方・面内上方)を回転行列から取る
-        rots = np.stack([g.rotation_ned() for g in self.course.gates])  # (G,3,3)
-        self.gate_pos = torch.tensor(gate_centers, device=self.device, dtype=torch.float32)   # (G,3) NED
-        self.gate_yaw = torch.tensor(gate_yaws, device=self.device, dtype=torch.float32)      # (G,)
-        self.gate_normal = torch.tensor(rots[:, :, 0], device=self.device, dtype=torch.float32)
-        self.gate_side = torch.tensor(rots[:, :, 1], device=self.device, dtype=torch.float32)
-        self.gate_up = torch.tensor(-rots[:, :, 2], device=self.device, dtype=torch.float32)
+        # --- コース(per-env対応) ---
+        # per_env: 各envに別コースを割り当てる(ゲートは表示専用+数値衝突)。有効化は
+        # collectorがカリキュラムstage>=5のときだけ cfg.per_env_courses を立てて制御する
+        # (envに渡るstageはcourse_stage=3で、カリキュラムstageとは別のため)。
+        self.per_env = bool(getattr(cfg, "per_env_courses", False))
+        self._env_ar = torch.arange(self.num_envs, device=self.device)
+        self._init_courses(seed)
 
         # --- シーン ---
         rng = np.random.default_rng(seed + 777)
@@ -100,7 +95,7 @@ class GenesisRaceEnv:
             vis_kwargs["env_separate_rigid"] = True
         rendered_idx = self.rig.rendered_envs_idx() or [0]
 
-        amb = SceneBuilder(self.course, rng, cfg.color_dr, cfg.clutter)
+        amb = SceneBuilder(self.course, rng, cfg.color_dr, cfg.clutter, per_env=self.per_env)
         self.builder = amb
         # 屋内シーン。ポイントライトは8192^2キューブシャドウマップを確保しVRAMを食い潰す
         # ため使わない。天井スラブは非表示(衝突のみ)にして平行光を屋内に届かせる
@@ -133,6 +128,8 @@ class GenesisRaceEnv:
         self.rig.attach(self.drone_entity)
         if extra_cameras:
             self._attach_extra_cameras()
+        if self.per_env:
+            self._place_gates_per_env()
 
         # --- モデル・センサー ---
         self.drone = DroneModel(self.drone_entity, self.scene.rigid_solver, cfg.drone, self.signs,
@@ -168,6 +165,91 @@ class GenesisRaceEnv:
         self.required_gates = 1
         self._all_idx = torch.arange(N, device=self.device)
         self._static_geom_start = None                    # 衝突フィルタ用(ドローン以外は全てstatic)
+
+    # --- コース初期化(単一 or per-envプール) ---
+
+    def _init_courses(self, base_seed: int):
+        """コースを生成し、ゲート幾何を (N,G,·) テンソルへ展開する。
+
+        per_env時は course_pool 種(0ならenvごとにユニーク)のコースを生成し env に割当てる。
+        非per_env時は全envが同一コース(pool=1)。どちらでもゲート参照は (N,G,·) で統一され、
+        indexは env-arange gather になる(挙動は従来と一致)。
+        """
+        cfg = self.cfg
+        N = self.num_envs
+        dev = self.device
+        if self.per_env:
+            K = cfg.course_pool if cfg.course_pool and cfg.course_pool > 0 else N
+            K = max(1, min(K, N))
+        else:
+            K = 1
+        specs = [CourseGenerator(seed=base_seed + j, stage=self.stage,
+                                 n_gates=cfg.n_gates).generate() for j in range(K)]
+        # 全コースは同一ゲート数(stage固定)である前提
+        self.course = specs[0]
+        self.pool_specs = specs
+        self.n_gates = self.course.n_gates
+        G = self.n_gates
+        env2course = np.array([e % K for e in range(N)], dtype=np.int64)
+        self.env2course = env2course
+
+        def _arrays(sp):
+            centers = np.stack([g.center_ned for g in sp.gates])           # (G,3)
+            yaws = np.array([g.yaw for g in sp.gates], dtype=np.float64)    # (G,)
+            rots = np.stack([g.rotation_ned() for g in sp.gates])          # (G,3,3)
+            arc = np.asarray(sp.gate_cum_arc, dtype=np.float64)            # (G,)
+            return centers, yaws, rots, arc
+
+        arrs = [_arrays(sp) for sp in specs]
+        centers = np.stack([arrs[c][0] for c in env2course]).astype(np.float32)   # (N,G,3)
+        yaws = np.stack([arrs[c][1] for c in env2course]).astype(np.float32)      # (N,G)
+        rots = np.stack([arrs[c][2] for c in env2course]).astype(np.float32)      # (N,G,3,3)
+        arc = np.stack([arrs[c][3] for c in env2course]).astype(np.float32)       # (N,G)
+        self.gate_pos = torch.tensor(centers, device=dev)                          # (N,G,3) NED
+        self.gate_yaw = torch.tensor(yaws, device=dev)                             # (N,G)
+        self.gate_normal = torch.tensor(rots[:, :, :, 0], device=dev)             # (N,G,3)
+        self.gate_side = torch.tensor(rots[:, :, :, 1], device=dev)
+        self.gate_up = torch.tensor(-rots[:, :, :, 2], device=dev)
+        self.gate_cum_arc = torch.tensor(arc, device=dev)                          # (N,G)
+        self.total_arc = torch.tensor(
+            np.array([max(specs[c].total_arc, 1e-6) for c in env2course], dtype=np.float32),
+            device=dev)                                                            # (N,)
+
+    def _place_gates_per_env(self):
+        """build後、per-envのゲート表示ボックスを各envのコース配置へ move する。
+
+        バーは非固定+gravity_compensation。set_pos/set_quat は envs_idx でenv一括指定。
+        コスト: (4×G) バー × 2 API ≈ 数百ms(起動時1回のみ)。
+        """
+        bars = getattr(self.builder, "gate_bar_entities", [])
+        if not bars:
+            return
+        dev = self.device
+        specs = self.pool_specs
+        # コースごと・ゲートごとの world中心/回転/quat を前計算
+        spec_gate = []
+        for sp in specs:
+            gl = []
+            for gate in sp.gates:
+                cw = np.array(ned2w(gate.center_ned), dtype=np.float64)
+                R_w = rot_ned_to_world(gate.rotation_ned())
+                q = np.array(np_R_to_quat(R_w), dtype=np.float64)
+                gl.append((cw, R_w, q))
+            spec_gate.append(gl)
+        env2c = self.env2course                                  # (N,)
+        for (ent, gi, off_side, off_up) in bars:
+            off = np.array([0.0, off_side, off_up], dtype=np.float64)
+            pos_c = np.stack([spec_gate[c][gi][0] + spec_gate[c][gi][1] @ off
+                              for c in range(len(specs))]).astype(np.float32)   # (K,3)
+            quat_c = np.stack([spec_gate[c][gi][2]
+                               for c in range(len(specs))]).astype(np.float32)  # (K,4)
+            pos = torch.tensor(pos_c[env2c], device=dev)                        # (N,3)
+            quat = torch.tensor(quat_c[env2c], device=dev)                      # (N,4)
+            # relative=False: pos/quatを直接world系として設定(morphのbuild時pose offsetを無視)。
+            # ゲートバーは非identity quatで生成されるため、set_quatも必ずrelative=Falseにする。
+            # (_all_idxはbuffer節で後から定義されるため、ここでは早期定義の_env_arを使う)
+            ent.set_pos(pos, envs_idx=self._env_ar, zero_velocity=True, relative=False)
+            ent.set_quat(quat, envs_idx=self._env_ar, zero_velocity=True, relative=False)
 
     # --- 追加カメラ(preview用) ---
 
@@ -208,14 +290,14 @@ class GenesisRaceEnv:
         dev = self.device
 
         # スポーン: スタートゲート内側・中心よりやや下・前傾-17.8°(実測)
-        start_pos = self.gate_pos[0].expand(n, 3).clone()
+        start_pos = self.gate_pos[envs_idx, 0].clone()      # (n,3) 各envのスタートゲート
         start_pos[:, 2] += cfg.spawn_below_center  # NED: d正=下
         jitter = (torch.rand(n, 3, device=dev) * 2 - 1) * 0.1
         pos = start_pos + jitter
         jd = math.radians(cfg.spawn_jitter_deg)
         roll = (torch.rand(n, device=dev) * 2 - 1) * jd
         pitch = math.radians(cfg.spawn_pitch_deg) + (torch.rand(n, device=dev) * 2 - 1) * jd
-        yaw = self.gate_yaw[0].expand(n).clone() + (torch.rand(n, device=dev) * 2 - 1) * jd
+        yaw = self.gate_yaw[envs_idx, 0].clone() + (torch.rand(n, device=dev) * 2 - 1) * jd
         active = torch.ones(n, device=dev, dtype=torch.long)
 
         # 途中スポーン(逆カリキュラム): 全ゲートのいずれかの2m手前・ゲート正対。
@@ -224,11 +306,11 @@ class GenesisRaceEnv:
         if self.resume_prob > 0.0 and self.n_gates > 2:
             resume = torch.rand(n, device=dev) < self.resume_prob
             k = torch.randint(1, self.n_gates, (n,), device=dev)
-            gp = self.gate_pos[k]
-            gn = self.gate_normal[k]
+            gp = self.gate_pos[envs_idx, k]
+            gn = self.gate_normal[envs_idx, k]
             rp = gp - gn * 2.0
             pos = torch.where(resume.unsqueeze(1), rp, pos)
-            yaw = torch.where(resume, self.gate_yaw[k], yaw)
+            yaw = torch.where(resume, self.gate_yaw[envs_idx, k], yaw)
             pitch = torch.where(resume, torch.zeros_like(pitch), pitch)
             active = torch.where(resume, k, active)
 
@@ -250,7 +332,7 @@ class GenesisRaceEnv:
         self.active_gate[envs_idx] = active
         self.spawn_gate[envs_idx] = active
         g1 = min(1, self.n_gates - 1)
-        self.spawn_dist_g1[envs_idx] = (pos - self.gate_pos[g1]).norm(dim=1)
+        self.spawn_dist_g1[envs_idx] = (pos - self.gate_pos[envs_idx, g1]).norm(dim=1)
         self._update_ribbon(envs_idx)
         self._update_glow(envs_idx)
         self.episode_steps[envs_idx] = 0
@@ -258,10 +340,10 @@ class GenesisRaceEnv:
         self.last_action[envs_idx] = 0.0
         self.prev_cmd[envs_idx] = 0.0
         self.collision[envs_idx] = False
-        gp = self.gate_pos[active]
+        gp = self.gate_pos[envs_idx, active]
         self.d_prev[envs_idx] = (pos - gp).norm(dim=1)
         rel = pos - gp
-        self.prev_x_rel[envs_idx] = (rel * self.gate_normal[active]).sum(dim=1)
+        self.prev_x_rel[envs_idx] = (rel * self.gate_normal[envs_idx, active]).sum(dim=1)
 
     # --- ステップ ---
 
@@ -285,7 +367,7 @@ class GenesisRaceEnv:
             self.imu.tick_analytic(state["quat_ned"], self.drone.last_specific_force_frd,
                                    state["omega_frd"], C.DT_PHYS)
             self._check_gate_pass(state, finish)
-            self._check_collision()
+            self._check_collision(state)
             self.episode_steps += 1
             self.steps_since_gate += 1
 
@@ -301,8 +383,8 @@ class GenesisRaceEnv:
         rgb = self.rig.render()
         self.img_queue.push(rgb)
         act_idx = self.active_gate.clamp(max=self.n_gates - 1)
-        gp = self.gate_pos[act_idx]
-        gn = self.gate_normal[act_idx]
+        gp = self.gate_pos[self._env_ar, act_idx]
+        gn = self.gate_normal[self._env_ar, act_idx]
         det = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=True)
         self.det_queue.push(det)
 
@@ -362,10 +444,10 @@ class GenesisRaceEnv:
 
     def _check_gate_pass(self, state, finish: torch.Tensor):
         act = self.active_gate.clamp(max=self.n_gates - 1)
-        gp = self.gate_pos[act]
-        gn = self.gate_normal[act]
-        gside = self.gate_side[act]
-        gup = self.gate_up[act]
+        gp = self.gate_pos[self._env_ar, act]
+        gn = self.gate_normal[self._env_ar, act]
+        gside = self.gate_side[self._env_ar, act]
+        gup = self.gate_up[self._env_ar, act]
         rel = state["pos_ned"] - gp
         x_rel = (rel * gn).sum(dim=1)
         crossed = (self.prev_x_rel < 0) & (x_rel >= 0) & (self.active_gate < self.n_gates)
@@ -385,8 +467,8 @@ class GenesisRaceEnv:
                 finish |= fin
                 # 新しいアクティブゲートへの基準を更新
                 na = self.active_gate.clamp(max=self.n_gates - 1)
-                np_ = self.gate_pos[na]
-                nn = self.gate_normal[na]
+                np_ = self.gate_pos[self._env_ar, na]
+                nn = self.gate_normal[self._env_ar, na]
                 nrel = state["pos_ned"] - np_
                 nx = (nrel * nn).sum(dim=1)
                 self.prev_x_rel = torch.where(passed, nx, self.prev_x_rel)
@@ -485,7 +567,10 @@ class GenesisRaceEnv:
                              envs_idx=idx, zero_velocity=True, relative=False)
             self._glow_vis[idx, k] = vis
 
-    def _check_collision(self):
+    def _check_collision(self, state=None):
+        if self.per_env:
+            self._check_collision_numeric(state)
+            return
         contacts = self.drone_entity.get_contacts()
         if contacts is None or "valid_mask" not in contacts:
             return
@@ -495,6 +580,45 @@ class GenesisRaceEnv:
         hit = torch.as_tensor(valid, device=self.device).any(dim=-1)
         grace = self.episode_steps < int(self.cfg.collision_grace_s * C.PHYS_HZ)
         self.collision |= hit & ~grace
+
+    # 数値衝突用のマージン(機体半サイズ ~0.14m)
+    _COLL_MARGIN = 0.14
+
+    def _check_collision_numeric(self, state):
+        """per-envモードの衝突判定(物理接触の代わり)。ホール境界 + アクティブゲート枠。
+
+        ホール(120×50×10, 固定)は全env共通。ゲート枠は各envのコース配置に対して、
+        面近傍(奥行±)かつ開口(1.5m)の外・外形(2.7m)の内=フレーム帯にいれば衝突。
+        """
+        if state is None:
+            return
+        m = self._COLL_MARGIN
+        pos = state["pos_ned"]                         # (N,3) NED (n,e,d)
+        hall = self.course.hall
+        n_c, e_c, d_c = pos[:, 0], pos[:, 1], pos[:, 2]
+        alt = -d_c                                     # world z (上正)
+        hall_hit = ((n_c.abs() > hall.length / 2 - m)
+                    | (e_c.abs() > hall.width / 2 - m)
+                    | (alt < m)
+                    | (alt > hall.height - m))
+        # アクティブゲート枠
+        act = self.active_gate.clamp(max=self.n_gates - 1)
+        gp = self.gate_pos[self._env_ar, act]
+        gn = self.gate_normal[self._env_ar, act]
+        gside = self.gate_side[self._env_ar, act]
+        gup = self.gate_up[self._env_ar, act]
+        rel = pos - gp
+        x_rel = (rel * gn).sum(dim=1).abs()
+        y_off = (rel * gside).sum(dim=1).abs()
+        z_off = (rel * gup).sum(dim=1).abs()
+        opening = GATE_INNER / 2                        # 0.75
+        outer = GATE_OUTER / 2                          # 1.35
+        near = x_rel < GATE_DEPTH / 2 + m
+        within = (y_off <= outer + m) & (z_off <= outer + m)
+        in_frame = within & ((y_off >= opening - m) | (z_off >= opening - m))
+        gate_hit = near & in_frame
+        grace = self.episode_steps < int(self.cfg.collision_grace_s * C.PHYS_HZ)
+        self.collision |= (hall_hit | gate_hit) & ~grace
 
     def _build_obs(self, state, actions):
         N = self.num_envs
@@ -521,10 +645,11 @@ class GenesisRaceEnv:
         act = self.active_gate.clamp(max=self.n_gates - 1)
         idx3 = torch.stack([act, (act + 1).clamp(max=self.n_gates - 1),
                             (act + 2).clamp(max=self.n_gates - 1)], dim=1)  # (N,3)
-        gp3 = self.gate_pos[idx3]                     # (N,3,3)
+        er = self._env_ar.unsqueeze(1)                # (N,1) env-arange for per-env gather
+        gp3 = self.gate_pos[er, idx3]                 # (N,3,3)
         rel3 = gp3 - state["pos_ned"].unsqueeze(1)
         rel3_body = quat_rotate_inv(state["quat_ned"].unsqueeze(1).expand(-1, 3, -1), rel3)
-        gy3 = self.gate_yaw[idx3]
+        gy3 = self.gate_yaw[er, idx3]
         # ゲート法線方位 − 機体ヨー
         x_body = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(N, 3)
         heading = quat_rotate(state["quat_ned"], x_body)
@@ -533,9 +658,9 @@ class GenesisRaceEnv:
 
         t_since_gate = self.steps_since_gate.float() * C.DT_PHYS
         ep_t = self.episode_steps.float() * C.DT_PHYS
-        # 弧長進捗
-        arc = torch.tensor(self.course.gate_cum_arc, device=self.device, dtype=torch.float32)
-        prog = arc[(self.active_gate - 1).clamp(min=0, max=self.n_gates - 1)] / max(self.course.total_arc, 1e-6)
+        # 弧長進捗(per-envコース対応: gate_cum_arc/total_arc は (N,G)/(N,))
+        gidx = (self.active_gate - 1).clamp(min=0, max=self.n_gates - 1)
+        prog = self.gate_cum_arc[self._env_ar, gidx] / self.total_arc
 
         priv = torch.cat(
             [
@@ -556,8 +681,8 @@ class GenesisRaceEnv:
         )
 
         # 真値closeness(報酬用・ノイズなし)
-        gp = self.gate_pos[act]
-        gn = self.gate_normal[act]
+        gp = self.gate_pos[self._env_ar, act]
+        gn = self.gate_normal[self._env_ar, act]
         det_true = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=False)
         closeness = (1.0 - det_true[:, 3]) * det_true[:, 2]
 

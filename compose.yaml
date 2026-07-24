@@ -76,7 +76,10 @@ services:
       - uv-cache:/root/.cache/uv
     profiles: ["tools"]
     command:
-      ["uv", "run", "tensorboard", "--logdir", "checkpoints/tb", "--host", "0.0.0.0"]
+      # TB2.21の実験的fast loader(rustboard)はNFS上の多数のtfeventsを読めず空表示になるため無効化。
+      # reload_multifileで学習中に増える複数eventファイルを追従させる。
+      ["uv", "run", "tensorboard", "--logdir", "checkpoints/tb", "--host", "0.0.0.0",
+       "--load_fast", "false", "--reload_multifile", "true"]
 
 volumes:
   torch-cache: {}

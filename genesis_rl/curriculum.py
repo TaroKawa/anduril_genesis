@@ -50,9 +50,14 @@ STAGES = [
     StageSpec(2, 4, 0.6, 0.3, False, False, 0.0),
     StageSpec(3, 18, 1.0, 0.0, True, False, 0.0),
     StageSpec(3, 18, 1.0, 0.3, True, True, 0.0),
-    # Stage5: 速度ボーナス廃止 → 実シミュレータ汎化のためノイズ&動力学DRを拡大
-    StageSpec(3, 18, 1.5, 0.3, True, True, 0.0, dr_scale=1.5),
+    # Stage5: 速度ボーナス廃止 → 実シミュレータ汎化のためノイズ&動力学DRを拡大。
+    # 途中スポーン(resume)は使わず初期位置スタートのみ(resume_prob=0)。コース多様化は
+    # per-env(各envに別コース)で行い、6000エピソード再構築には頼らない。
+    StageSpec(3, 18, 1.5, 0.0, True, True, 0.0, dr_scale=1.5),
 ]
+
+# 最終ステージ(=per-envコース/初期位置スタート/再構築なし)のindex
+PER_ENV_STAGE = len(STAGES) - 1
 
 
 class CurriculumManager:
@@ -87,6 +92,9 @@ class CurriculumManager:
         線形に減衰させて正規スタートの比率を上げる。
         """
         spec = self.spec
+        # 最終ステージは初期位置スタートのみ(逆カリキュラムのアニールを無効化)
+        if self.stage >= PER_ENV_STAGE:
+            return 0.0
         if not self.cfg.enabled:
             return spec.resume_prob
         th = self.cfg.thresholds[min(self.stage, len(self.cfg.thresholds) - 1)]
@@ -105,6 +113,9 @@ class CurriculumManager:
         return False
 
     def needs_rebuild(self) -> bool:
+        # 最終ステージはper-envで多様なコースを常時適用するため定期再構築しない
+        if self.stage >= PER_ENV_STAGE:
+            return False
         return self.episodes_since_rebuild >= self.cfg.rebuild_episodes
 
     def next_course_seed(self, base_seed: int) -> int:

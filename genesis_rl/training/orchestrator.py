@@ -322,6 +322,8 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_lis
         # learner(専有GPU)を遊ばせない: replay_ratio_cap に達するまで連続更新する。
         # can_update()==False になると update_once() が None を返して自然に止まる
         # (=UTD上限=過学習防止は replay_ratio_cap が担保。syncモードの range(64) 相当を非同期にも適用)。
+        # 注: 取り込みを別スレッド化するとGILで取り込みが飢餓 → キュー詰まり → collectorが
+        # put()でブロックして収集が激減(実測: 1.07M→230k遷移/min, UTD≈40)。単一スレッドが最適。
         updated = 0
         for _ in range(128):
             if learner.update_once() is None:

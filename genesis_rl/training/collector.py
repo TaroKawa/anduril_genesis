@@ -17,7 +17,7 @@ import torch
 
 from .. import contracts as C
 from ..config import TrainConfig
-from ..curriculum import CurriculumManager, STAGES
+from ..curriculum import CurriculumManager, PER_ENV_STAGE, STAGES
 from ..envs.genesis_race_env import GenesisRaceEnv
 from ..models.actor import SACActor
 from ..models.encoder import FrozenDINOv2
@@ -49,6 +49,8 @@ class Collector:
         env_cfg.stage = spec.course_stage
         env_cfg.color_dr = spec.color_dr
         env_cfg.clutter = spec.clutter
+        # per-envコースはカリキュラムstage>=5かつ設定ON時のみ有効化(それ以外は従来の単一コース)
+        env_cfg.per_env_courses = bool(cfg.env.per_env_courses) and stage >= PER_ENV_STAGE
         # rankごとにRNG系列をずらす(コース形状はcourse_seedで共通、ノイズ/DR/スポーンが分岐)
         self.env = GenesisRaceEnv(env_cfg, num_envs=env_cfg.num_envs, course_seed=course_seed,
                                   stage=spec.course_stage,
