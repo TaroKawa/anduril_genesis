@@ -91,6 +91,9 @@ class FlightRecorder:
                 "center": _to_list(og.get("center", (0.5, 0.5))),
                 "rel_dist": float(og.get("rel_dist", 1.0)),
                 "age_s": float(now - float(og.get("t_wall", now))),
+                # YOLOX使用時のみ: 生bbox(x1,y1,x2,y2 px)とスコア(至近クリップ等の診断用)
+                "box": _to_list(og["box"]) if og.get("box") is not None else None,
+                "score": float(og.get("score", 0.0)),
             },
             "race": {
                 "active_gate_index": int(race.get("active_gate_index", -1)),

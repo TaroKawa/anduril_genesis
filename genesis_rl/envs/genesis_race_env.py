@@ -165,6 +165,12 @@ class GenesisRaceEnv:
         self.required_gates = 1
         self._all_idx = torch.arange(N, device=self.device)
         self._static_geom_start = None                    # 衝突フィルタ用(ドローン以外は全てstatic)
+        # 測光DR(cfg.render.photo_dr>0時のみ使用): per-envのゲイン/ガンマ/コントラスト/ノイズ
+        self._photo_gain = torch.ones(N, 1, 1, 3, device=self.device)
+        self._photo_gamma = torch.ones(N, 1, 1, 1, device=self.device)
+        self._photo_contrast = torch.ones(N, 1, 1, 1, device=self.device)
+        self._photo_offset = torch.zeros(N, 1, 1, 1, device=self.device)
+        self._photo_noise = torch.zeros(N, 1, 1, 1, device=self.device)
 
     # --- コース初期化(単一 or per-envプール) ---
 
@@ -329,6 +335,16 @@ class GenesisRaceEnv:
             s.img_delay_frames + torch.randint(0, s.img_delay_jitter + 1, (n,), device=dev), envs_idx)
         self.act_delay[envs_idx] = s.act_delay_steps + torch.randint(0, s.act_delay_jitter + 1, (n,), device=dev)
 
+        # 測光DRパラメータの再サンプル(エピソード粒度)
+        p = float(getattr(cfg.render, "photo_dr", 0.0))
+        if p > 0.0:
+            u = lambda lo, hi, *sh: torch.rand(n, *sh, device=dev) * (hi - lo) + lo
+            self._photo_gain[envs_idx] = (1.0 + u(-0.35 * p, 0.35 * p, 1, 1, 3))
+            self._photo_gamma[envs_idx] = torch.exp(u(-0.45 * p, 0.45 * p, 1, 1, 1))
+            self._photo_contrast[envs_idx] = 1.0 + u(-0.30 * p, 0.30 * p, 1, 1, 1)
+            self._photo_offset[envs_idx] = u(-0.10 * p, 0.10 * p, 1, 1, 1)
+            self._photo_noise[envs_idx] = u(0.0, 0.03 * p, 1, 1, 1)
+
         self.active_gate[envs_idx] = active
         self.spawn_gate[envs_idx] = active
         g1 = min(1, self.n_gates - 1)
@@ -381,6 +397,8 @@ class GenesisRaceEnv:
         self._tick_blink()
         # --- フレーム境界(30Hz): レンダ + 検出 ---
         rgb = self.rig.render()
+        if float(getattr(cfg.render, "photo_dr", 0.0)) > 0.0:
+            rgb = self._apply_photo_dr(rgb)
         self.img_queue.push(rgb)
         act_idx = self.active_gate.clamp(max=self.n_gates - 1)
         gp = self.gate_pos[self._env_ar, act_idx]
@@ -566,6 +584,21 @@ class GenesisRaceEnv:
             glows[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
                              envs_idx=idx, zero_velocity=True, relative=False)
             self._glow_vis[idx, k] = vis
+
+    def _apply_photo_dr(self, rgb_u8: torch.Tensor) -> torch.Tensor:
+        """per-env測光変換: ガンマ→コントラスト→per-channelゲイン→輝度オフセット→ノイズ。
+
+        レンダラ(Madrona/rasterizer/実シムDCL)の色応答・露出・粒状感の差を学習時に
+        経験させ、視覚特徴のドメイン過適合を防ぐ。(N,H,W,3) uint8 → 同形uint8。
+        """
+        x = rgb_u8.float() / 255.0
+        x = x.clamp(min=1e-4).pow(self._photo_gamma)
+        x = (x - 0.45) * self._photo_contrast + 0.45
+        x = x * self._photo_gain + self._photo_offset
+        noise = self._photo_noise
+        if bool((noise > 0).any()):
+            x = x + torch.randn_like(x) * noise
+        return (x.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
 
     def _check_collision(self, state=None):
         if self.per_env:

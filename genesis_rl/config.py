@@ -30,6 +30,13 @@ class RenderConfig:
     height: int = 180
     jpeg_dr: bool = False         # JPEG劣化DR(逐次モードのみ推奨)
     max_seq_envs: int = 16        # sequentialバックエンドの実レンダenv数上限(per collector)
+    # 測光ドメインランダム化の強さ(0=無効)。per-envのゲイン/ガンマ/コントラスト/ノイズを
+    # エピソードごとに再サンプルしてレンダフレームへ適用する。レンダ実装(Madrona/EGLラスタ/
+    # ホストGL/実シムDCL)間の色応答・露出差に対する方策の視覚頑健化が目的(sim2sim転移で必須。
+    # latest.pt世代は学習レンダの絵に過適合し、同一シーンでもレンダ実装が変わるとゲート整列に
+    # 失敗することを確認済み: コンテナEGL=9/11通過 vs ホストGL=1/16 vs DCL=0/18、
+    # runs/genesis_ab_madrona vs genesis_ab2 vs dcl_fable_0724b)。
+    photo_dr: float = 0.0
 
 
 @dataclass

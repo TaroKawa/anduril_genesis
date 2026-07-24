@@ -15,6 +15,12 @@ env:
     width: 320
     height: 180
     max_seq_envs: 8     # batch不可時(sequential)のフォールバック上限
+    photo_dr: 1.0       # 測光DR(ガンマ/ゲイン/コントラスト/ノイズをper-env・エピソード毎)。
+                        # latest.pt世代はMadronaの絵に視覚過適合し、レンダ実装が変わるだけで
+                        # ゲート整列に失敗(コンテナEGL=9/11通過 vs ホストGL=1/16 vs DCL実シム=0/18)。
+                        # sim2sim転移の要。実装: config.py RenderConfig / genesis_race_env.py
+                        # (_apply_photo_dr)とセットで反映すること。有効化直後はgates_mean/成功率が
+                        # 一時的に下がるが、回復後の値が転移頑健性の指標になる。
 
 sac:
   batch_size: 2548         # learner専有A100を活かす。大量の新鮮データ向けに1024→2048

@@ -266,6 +266,9 @@ def gate_detect_hsv(img_bgr: np.ndarray, gate_area_max: float | None = None) -> 
     w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
     cx, cy = centroids[i]
     H, W = img_bgr.shape[:2]
+    # 至近でゲート枠が画面全面に及ぶ場合は不可視扱い(yolox_gate.py と同じ契約合わせ)
+    if w > 0.9 * W and h > 0.9 * H:
+        return {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
     from ..contracts import GATE_AREA_MAX
     gam = GATE_AREA_MAX if gate_area_max is None else gate_area_max
     rel = float(np.clip(1.0 - (w * h) / gam, 0.0, 1.0))
@@ -273,10 +276,20 @@ def gate_detect_hsv(img_bgr: np.ndarray, gate_area_max: float | None = None) -> 
 
 
 class VideoRX:
-    """映像UDP受信スレッド。チャンク分割JPEGを組み立て → obs_rgb/obs_gate を publish。
+    """映像UDP受信。組立専用RXスレッド + 最新フレームのみ処理する推論スレッドの2段構成。
+
+    旧実装は受信スレッド内で JPEGデコード+YOLOX(~31ms)+mp4書き出しを直列実行しており、
+    30fps(33ms)を下回るとOSソケットバッファ(8MB≈10秒分)に映像が滞留、方策が数秒前の
+    フレームで判断して墜落していた(runs/dcl_fable_0724 で実測: 遅延~10s)。
+    RXスレッドはチャンク組立と「最新完成JPEG」の差し替えだけを行い、処理スレッドは常に
+    最新フレームだけを取り出して検出・publish する(処理が遅ければ古いフレームは自然に
+    スキップ)。これで観測遅延は フレーム間隔+処理時間 ≈ 30-70ms に有界化され、Genesis
+    学習時の img_delay 1-2フレーム(33-66ms)と一致する。
 
     obs_rgb: 224x224 RGB uint8(学習時のto_resnet入力と同じ全面リサイズ)。
     録画: 生フレーム+HUDを mp4 へ逐次書き出し(out指定時)。
+    シムのフレームヘッダ sim_time_ns(サーバ時計)を shared["video_sim_t"] へ公開し、
+    HIGHRES_IMU の time_usec と突き合わせて実遅延 lag_s を常時計測できるようにする。
     """
 
     def __init__(self, shared: dict, ip: str = "0.0.0.0", port: int = 5600,
@@ -287,19 +300,26 @@ class VideoRX:
         self._out = out_mp4
         # ゲート検出器: 既定は YOLOX(run() が注入)。None のときは HSV フォールバック。
         self._detect = gate_detect_fn or gate_detect_hsv
-        self.frames = 0
+        self.frames = 0        # 処理(検出・publish)したフレーム数
+        self.rx_frames = 0     # 組み立て完了したフレーム数
         self.packets = 0
+        self.lag_s = 0.0       # 実測遅延: IMU時刻と同基準なら真の遅延、違えばパイプライン滞留
+        self._newest_t_ns = 0  # RXが組み立てた最新フレームのサーバ時刻(滞留計測用)
+        self._latest = None    # (jpeg_bytes, fid, sim_time_ns) 最新完成フレーム
+        self._latest_lock = threading.Lock()
+        self._latest_ev = threading.Event()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         self.sock.bind((self.ip, self.port))
         self.sock.settimeout(0.5)
         self.is_running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread = threading.Thread(target=self._rx_loop, daemon=True)
         self.thread.start()
+        self.proc_thread = threading.Thread(target=self._proc_loop, daemon=True)
+        self.proc_thread.start()
 
-    def _loop(self):
-        import cv2
-
+    def _rx_loop(self):
+        """組立専用: recvfrom → チャンク組立 → 最新JPEGの差し替えのみ(重い処理は禁止)。"""
         header_fmt = "<IHHIIQ"
         header_sz = struct.calcsize(header_fmt)
         frames: dict = {}
@@ -311,11 +331,17 @@ class VideoRX:
                 packet, _ = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except OSError:
+                return   # close()でソケットが閉じられた
             self.packets += 1
-            fid, cid, total, jpeg_size, _, _ = struct.unpack(header_fmt, packet[:header_sz])
-            f = frames.setdefault(fid, {"chunks": {}, "total": total})
+            fid, cid, total, jpeg_size, _, sim_time_ns = struct.unpack(header_fmt, packet[:header_sz])
+            f = frames.setdefault(fid, {"chunks": {}, "total": total, "t_ns": sim_time_ns})
             f["chunks"][cid] = packet[header_sz:]
             if len(f["chunks"]) < f["total"]:
+                # 古い未完成フレームの掃除(パケットロスでの滞留・メモリ増を防ぐ)
+                if len(frames) > 8:
+                    for old in sorted(frames)[:-8]:
+                        del frames[old]
                 continue
             buf = bytearray()
             ok = True
@@ -324,15 +350,38 @@ class VideoRX:
                     ok = False
                     break
                 buf.extend(f["chunks"][i])
+            t_ns = f["t_ns"]
             del frames[fid]
             if not ok:
                 continue
-            img = cv2.imdecode(np.frombuffer(bytes(buf), np.uint8), cv2.IMREAD_COLOR)
+            self.rx_frames += 1
+            self._newest_t_ns = max(self._newest_t_ns, t_ns)
+            with self._latest_lock:
+                # 常に新しいfidだけ保持(古いフレームは捨てる=drop-to-latest)
+                if self._latest is None or fid > self._latest[1]:
+                    self._latest = (bytes(buf), fid, t_ns)
+            self._latest_ev.set()
+
+    def _proc_loop(self):
+        """処理専用: 最新フレームを取り出し デコード→検出→publish→録画。"""
+        import cv2
+
+        last_fid = -1
+        while self.is_running:
+            if not self._latest_ev.wait(timeout=0.5):
+                continue
+            with self._latest_lock:
+                item = self._latest
+                self._latest_ev.clear()
+            if item is None or item[1] == last_fid:
+                continue
+            buf, last_fid, t_ns = item
+            img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 continue
-            self._process(img)
+            self._process(img, t_ns)
 
-    def _process(self, img_bgr):
+    def _process(self, img_bgr, sim_time_ns: int = 0):
         import cv2
 
         now = time.time()
@@ -340,8 +389,16 @@ class VideoRX:
         det["t_wall"] = now
         self.shared["obs_gate"] = det
         rgb224 = cv2.cvtColor(cv2.resize(img_bgr, (224, 224)), cv2.COLOR_BGR2RGB)
-        self.shared["obs_rgb"] = {"t_wall": now, "rgb": rgb224}
+        self.shared["obs_rgb"] = {"t_wall": now, "rgb": rgb224, "sim_t": sim_time_ns * 1e-9}
         self.frames += 1
+        # 実測映像遅延: IMUのシム時刻とフレームのサーバ時刻が同一基準ならその差=真の遅延。
+        # 時計基準が違う(epoch vs boot相対)場合は、RX最新フレームとの差=パイプライン滞留。
+        imu = self.shared.get("imu")
+        if sim_time_ns:
+            if imu and abs(imu["t"] - sim_time_ns * 1e-9) < 60.0:
+                self.lag_s = max(0.0, imu["t"] - sim_time_ns * 1e-9)
+            else:
+                self.lag_s = max(0.0, (self._newest_t_ns - sim_time_ns) * 1e-9)
 
         if self._out:
             if self._writer is None:
@@ -362,7 +419,9 @@ class VideoRX:
     def close(self):
         """受信を止め、動画を確実にクローズする(呼び出し側スレッドで行う)。"""
         self.is_running = False
+        self._latest_ev.set()   # 処理スレッドのwait解除
         self.thread.join(timeout=3.0)
+        self.proc_thread.join(timeout=3.0)
         try:
             self.sock.close()
         except OSError:
@@ -660,8 +719,14 @@ def make_gate_detector(kind: str, yolox_ckpt: str, gate_area_max: float | None =
         import torch
 
         from .yolox_gate import GateYOLOX
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return GateYOLOX(yolox_ckpt, dev, gate_area_max=gate_area_max).detect
+        # 方策(cuda:0)とのGPU競合を避ける: 2GPU構成ならYOLOXは cuda:1 へ。
+        # 同一GPUだと YOLOX 31ms + 方策 10ms が33ms周期を超えfpsが割れる(実測)。
+        if torch.cuda.is_available():
+            dev = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda")
+        else:
+            dev = torch.device("cpu")
+        gy = GateYOLOX(yolox_ckpt, dev, gate_area_max=gate_area_max)
+        return functools.partial(gy.detect, return_box=True)   # bboxはrecorderの診断ログ用
     except Exception as e:
         print(f"WARNING: YOLOX初期化に失敗 ({type(e).__name__}: {e}) → HSV検出にフォールバック",
               flush=True)
@@ -755,12 +820,44 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         next_policy_t = 0.0
         next_tx_t = 0.0
         last_status_t = 0.0
+        last_active_t = time.time()   # 最後に「レース進行中(飛行 or 開始待ち)」だった時刻
+        last_motion_t = time.time()   # 最後に機体の運動を観測した時刻(グレース内墜落の検出用)
         while True:
             now = time.time()
             mav.heartbeat_if_due()
 
             race = shared.get("race") or {}
             flying = bool(race.get("pin_released"))
+
+            # --- ウォッチドッグ1: レースが立ち上がらない/中断されたまま(ピン解除前の
+            # 墜落等でレースだけ終わるとリセット契機がなく永久待機になる)→ シムをリセット
+            if flying or race.get("start_pending"):
+                last_active_t = now
+            elif now - last_active_t > 6.0:
+                print("WATCHDOG: no active race for 6s -> reset & re-arm", flush=True)
+                if recorder is not None:
+                    recorder.record_event({"type": "watchdog_idle", "t_wall": now})
+                reset_sim_and_wait(" (idle watchdog)")
+                time.sleep(1.0)
+                mav.arm()
+                last_active_t = time.time()
+
+            # --- ウォッチドッグ2: 飛行中のはずなのに機体が3秒以上無動作(発進グレース
+            # 1.5秒以内の衝突は比力スパイク判定をすり抜け、床に転がったまま止まる)→ リセット
+            imu_now = shared.get("imu") or {}
+            gy = imu_now.get("gyro", (0.0, 0.0, 0.0))
+            if not flying or (gy[0] ** 2 + gy[1] ** 2 + gy[2] ** 2) ** 0.5 > 0.03:
+                last_motion_t = now
+            elif now - last_motion_t > 3.0:
+                print("WATCHDOG: flying but motionless 3s (crashed in grace?) -> reset & re-arm",
+                      flush=True)
+                if recorder is not None:
+                    recorder.record_event({"type": "watchdog_motionless", "t_wall": now})
+                reset_sim_and_wait(" (motionless watchdog)")
+                time.sleep(3.0)
+                mav.arm()
+                last_motion_t = last_active_t = time.time()
+                continue
             if flying and now >= next_policy_t:      # 30Hzで方策決定
                 next_policy_t = max(next_policy_t + 1.0 / C.POLICY_HZ, now)
                 cmd = pilot.decide(shared)
@@ -804,7 +901,8 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
                 print(f"[dcl] t={now - t_start:6.1f}s pin={int(flying)} "
                       f"gate={race.get('active_gate_index', '-')} "
                       f"det={int(og.get('visible', 0))} rel={og.get('rel_dist', 1.0):.2f} "
-                      f"frames={video.frames} pkts={video.packets} thr={cmd[3]:.3f}", flush=True)
+                      f"proc={video.frames}/{video.rx_frames} lag={video.lag_s * 1000:.0f}ms "
+                      f"thr={cmd[3]:.3f}", flush=True)
 
             if max_sec and now - t_start > max_sec:
                 print(f"Time limit ({max_sec:.0f}s); stopping.", flush=True)

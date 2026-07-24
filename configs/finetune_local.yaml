@@ -1,0 +1,62 @@
+# sim2sim視覚頑健化のローカルfine-tune(RTX 4060 learner + 3070Ti collector、コンテナ内EGLレンダ)。
+#
+# 背景: latest.pt(stage5, 442M遷移)は学習レンダ(サーバーMadrona)の絵に視覚過適合しており、
+# レンダ実装が変わるだけでゲート整列に失敗する(検証: コンテナEGLラスタ=9/11通過
+# [runs/genesis_ab_madrona] vs ホストGL=1/16 [runs/genesis_ab2]、DCL実シム=0/18)。
+# 本設定は render.photo_dr による測光DRを加えて視覚ドメイン頑健化だけを狙った短期fine-tune。
+# checkpoints_ft/ に完全分離(checkpoints/ はサーバー学習が同期しているため触らない)。
+# ※WSL2ではVulkanが無くMadrona不可(コンテナ内も同様)→ sequential(EGL)で全envレンダ。
+#
+# 起動(コンテナ内、リポジトリルート):
+#   docker run --rm --gpus all -e PYOPENGL_PLATFORM=egl -e PYTHONUNBUFFERED=1 \
+#     -v .:/app -w /app --shm-size 16g anduril-genesis-rl:latest \
+#     uv run python -m genesis_rl.scripts.train --config configs/finetune_local.yaml --resume auto
+env:
+  num_envs: 48          # sequential(コンテナEGL)は全envを個別レンダするため小さく。
+                        # ※WSL2ではMadrona(Vulkan)不可 → batch指定でもsequentialへ落ちる。
+                        #   max_seq_envs=num_envs にして全envに実画像を出す(ブランク特徴env防止)
+  n_gates: 18
+  course_seed: 0
+  stage: 5              # curriculum.json(stage5)が優先されるが明示
+  per_env_courses: true
+  course_pool: 48
+  render:
+    backend: sequential # コンテナ内EGL+NVIDIAラスタ(この絵なら現方策が9/11でゲート通過=準in-domain)
+    width: 320
+    height: 180
+    max_seq_envs: 48
+    photo_dr: 1.0       # 測光DR: レンダラ間(Madrona/rasterizer/DCL)の色応答差を吸収する要
+
+sac:
+  batch_size: 512
+  replay_capacity: 250000   # 1遷移≈12KB → 約3GB(8GB learner向け)
+  success_capacity: 50000
+  n_step: 3
+  success_ratio: 0.5
+  burn_in_steps: 0          # 学習済み方策で収集開始(ランダムwarmupなし)
+  learn_start: 20000
+  replay_ratio_cap: 4.0
+  weight_sync_sec: 1.0
+  total_transitions: 30000000   # fine-tune予算(~30M)
+  compile: false
+  encoder_chunk: 128
+
+curriculum:
+  enabled: true
+  window: 200
+  thresholds: [0.7, 0.7, 0.7, 0.6, 0.5]
+  rebuild_episodes: 6000
+  seed_pool: 32
+  resume_hi: 0.8
+
+run:
+  mode: async
+  ckpt_dir: checkpoints_ft
+  eval_interval: 250000
+  eval_video: false      # VRAM節約(評価は別途ホストでA/B)
+  profile: false
+
+hw:
+  learner_gpu: 0         # RTX 4060
+  collector_gpus: [1]    # RTX 3070 Ti
+  num_collectors: 1

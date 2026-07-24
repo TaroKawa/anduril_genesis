@@ -332,6 +332,19 @@ class GateYOLOX:
         x1, y1, x2, y2 = best[:4] / r          # 元画像(640x360)座標へ戻す
         x1 = float(np.clip(x1, 0, W)); x2 = float(np.clip(x2, 0, W))
         y1 = float(np.clip(y1, 0, H)); y2 = float(np.clip(y2, 0, H))
+        # 至近でゲート枠が画面からはみ出すと bbox がフレームへクリップされ、bbox中心が
+        # 「ほぼ整列」という偽信号になる(実際はズレていても)。学習側 SimGateDetector の
+        # 契約では投影中心が画面外に出た時点で不可視。bboxが画面端の3辺以上に達している=
+        # ゲートが視野を包んでおり真の中心を推定できない状態なので、不可視として扱う
+        # (runs/dcl_fable_0724b の最接近時に center が0.5に張り付いたまま枠へ接触する
+        #  事象の対策。激突直前フレームの実測bbox=(0,0,640,310)は左/上/右の3辺接触)。
+        edges = int(x1 <= 2) + int(y1 <= 2) + int(x2 >= W - 2) + int(y2 >= H - 2)
+        if edges >= 3 or ((x2 - x1) > 0.9 * W and (y2 - y1) > 0.9 * H):
+            res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
+            if return_box:
+                res["box"] = (x1, y1, x2, y2)
+                res["score"] = float(best[4] * best[5])
+            return res
         cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
         area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
         rel = float(np.clip(1.0 - area / self.gate_area_max, 0.0, 1.0))
