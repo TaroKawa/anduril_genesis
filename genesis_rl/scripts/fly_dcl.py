@@ -32,6 +32,8 @@ def main():
                     help="受信FPVの録画先mp4(''で無効)")
     ap.add_argument("--max-sec", type=float, default=0.0, help=">0なら指定秒数で自動終了")
     ap.add_argument("--no-reset-on-collision", action="store_true")
+    ap.add_argument("--stochastic", action="store_true",
+                    help="方策をtanh-Gaussianからサンプリング(既定=決定論的な平均行動)")
     ap.add_argument("--no-relay", action="store_true",
                     help="Windows側リレーの自動起動を無効化(手動起動する場合)")
     from ..dcl.client import DEFAULT_YOLOX_CKPT
@@ -60,7 +62,7 @@ def main():
         reset_on_collision=not args.no_reset_on_collision, relay=not args.no_relay,
         gate_detector=args.gate_detector, yolox_ckpt=args.yolox_ckpt,
         record_dir=args.record_dir or None, sysid=args.sysid,
-        sysid_plan=args.sysid_plan,
+        sysid_plan=args.sysid_plan, stochastic=args.stochastic,
         gate_area_max=(args.gate_area_max or None))
 
 

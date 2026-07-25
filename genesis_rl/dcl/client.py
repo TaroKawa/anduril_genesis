@@ -559,7 +559,7 @@ class ScriptedRatePilot:
 class GenesisPilot:
     """学習方策(新旧構造自動判別)で観測→物理コマンドを計算する。"""
 
-    def __init__(self, ckpt_path: str):
+    def __init__(self, ckpt_path: str, stochastic: bool = False):
         import torch
 
         from .. import contracts as C
@@ -568,7 +568,11 @@ class GenesisPilot:
         self.C = C
         self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy = LoadedPolicy(ckpt_path, self.device, num_envs=1)
+        self.policy = LoadedPolicy(ckpt_path, self.device, num_envs=1,
+                                   deterministic=not stochastic)
+        print(f"GenesisPilot: action sampling = "
+              f"{'stochastic (tanh-Gaussian)' if stochastic else 'deterministic (mean)'}",
+              flush=True)
         self.action_map = C.ActionMap()
         # 送信スケール = 学習時プラントゲイン / デプロイ時プラントゲイン(軸別)。
         #   学習時: ckpt の cfg スナップショットの drone.cmd_gain(欠落=旧ckptは 1.0)。
@@ -743,7 +747,7 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         relay: bool = True, gate_detector: str = "yolox",
         yolox_ckpt: str = DEFAULT_YOLOX_CKPT,
         record_dir: str | None = None, sysid: bool = False,
-        sysid_plan: str = "rate",
+        sysid_plan: str = "rate", stochastic: bool = False,
         gate_area_max: float | None = None) -> None:
     import collections
     import signal
@@ -764,7 +768,7 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         pilot = ScriptedRatePilot(plan=sysid_plan)   # 方策を外した開ループ同定
         print("SYSID mode: 方策なし・既知コマンド列を送出します", flush=True)
     else:
-        pilot = GenesisPilot(ckpt)           # 重いロードを接続前に済ませる(後始末不要フェーズ)
+        pilot = GenesisPilot(ckpt, stochastic=stochastic)  # 重いロードを接続前に済ませる(後始末不要フェーズ)
     gate_fn = make_gate_detector(gate_detector, yolox_ckpt, gate_area_max)  # YOLOX/HSV も接続前にロード
     recorder = None
     if record_dir:
@@ -772,7 +776,8 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         recorder = FlightRecorder(record_dir, meta={
             "ckpt": ckpt, "contract_hash": C.contract_hash(),
             "gate_detector": gate_detector, "policy_hz": C.POLICY_HZ,
-            "sysid": sysid, "sysid_plan": sysid_plan if sysid else None})
+            "sysid": sysid, "sysid_plan": sysid_plan if sysid else None,
+            "stochastic": stochastic})
         shared["imu_log"] = collections.deque(maxlen=200_000)  # rxスレッドが積む
     relay_proc = None
     mav = None
