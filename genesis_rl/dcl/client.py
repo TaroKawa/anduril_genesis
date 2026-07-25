@@ -621,14 +621,16 @@ class GenesisPilot:
                                np.clip(age_s / C.GATE_OBS_MAX_AGE_S, 0.0, 1.0))
         else:
             vec[C.VEC_GATE] = (0.0, 0.0, 0.0, 1.0, 1.0)
-        # Genesis規約(genesis_race_env.py: onehot[max(active_gate-1,0)])に合わせる。
-        # DCLのactive_gate_indexはGenesisのactive_gateと同義(狙うゲートの0始まりindex、
-        # ゲート通過でインクリメント)。生値をそのまま使うと2本目以降で+1ズレる
-        # (runs/sysid_0723_0321でgate0→1遷移を確認しoff-by-one確定)。
+        # one-hot = 通過済みゲート数(Genesis規約: onehot[active_gate-1]、スポーン時
+        # active_gate=1 → onehot[0])。DCLのactive_gate_indexは0始まりで「通過済み本数」
+        # (スポーン=0、最初のゲート通過で1)なので、そのままがGenesisのonehot indexに一致する:
+        #   スポーン:   Genesis onehot[0] / DCL agi=0 → [0] ✓
+        #   1本通過後:  Genesis onehot[1] / DCL agi=1 → [1] ✓
+        # 旧実装の max(agi-1,0) はスポーン時だけclampで偶然一致し、1本通過後も[0]のままに
+        # なる(方策は「まだ0本」と誤認)。「ゲート1は通るが2以降が全滅」の主因だった。
         agi = int((shared.get("race") or {}).get("active_gate_index", 0))
-        passed = max(agi - 1, 0)
-        if 0 <= passed < C.MAX_GATES:
-            vec[C.VEC_ONEHOT.start + passed] = 1.0
+        passed = min(max(agi, 0), C.MAX_GATES - 1)
+        vec[C.VEC_ONEHOT.start + passed] = 1.0
         vec[C.VEC_LAST_ACTION] = self.last_action
         return vec
 

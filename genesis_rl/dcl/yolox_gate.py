@@ -331,10 +331,15 @@ class GateYOLOX:
 
     def __init__(self, ckpt_path: str, device: torch.device,
                  num_classes: int = 1, input_size: tuple[int, int] = (640, 640),
-                 conf_thre: float = 0.5, nms_thre: float = 0.45,
+                 conf_thre: float = 0.4, nms_thre: float = 0.45,
                  fp16: bool | None = None, gate_area_max: float | None = None,
-                 min_area: float = 1500.0, max_side: float = 30000.0,
+                 min_area: float = 500.0, max_side: float = 30000.0,
                  orange_thr: float = GATE_ORANGE_THR):
+        # conf/min_area は andu_ddrnet(0.5/1500)から緩和: 学習側 SimGateDetector の契約は
+        # 45mまで検出で、遠方ゲートはbboxが小さく(40mで~450px²)スコアも低い(実測0.3台)。
+        # 0.5/1500のままだとゲート通過直後の次ゲート(遠い)が長時間不可視になり、
+        # 方策が航法手掛かりを失う(runs/dcl_onehot_fix: agi=1区間の可視率20%)。
+        # 誤検出はオレンジ率チェック(orange_thr)が引き続き除去する。
         from ..contracts import GATE_AREA_MAX
 
         self.device = device
@@ -378,8 +383,12 @@ class GateYOLOX:
                 res["score"] = 0.0
             return res
 
-        # andu_ddrnet と同一の後処理: 元画像座標へ戻し min_area/max_side でフィルタ →
-        # 面積最大の1個だけ採用 → ボックス内オレンジ率で本物のゲートか検証
+        # andu_ddrnet 準拠の後処理: 元画像座標へ戻し min_area/max_side でフィルタ →
+        # 面積最大の1個だけ採用 → ボックス内オレンジ率で本物のゲートか検証。
+        # 追加(deploy実測に基づく): 画面端3辺以上に達する「視野を覆う巨大box」は選択前に
+        # 除外する。ゲート通過直後はこの種のbox(score~0.5-0.65, 面積~23万px²)が出続け、
+        # 面積最大選択が本物の次ゲート(score0.9台)より優先してしまい、agi=1区間の可視率が
+        # 20%まで落ちていた(runs/dcl_onehot_fix)。除外すれば次ゲートが正しく選ばれる。
         d = dets.cpu().numpy()
         boxes = d[:, :4] / r
         boxes[:, 0::2] = boxes[:, 0::2].clip(0, W)
@@ -391,6 +400,9 @@ class GateYOLOX:
             keep &= (bw * bh) >= self.min_area
         if self.max_side > 0:
             keep &= np.maximum(bw, bh) <= self.max_side
+        n_edges = ((boxes[:, 0] <= 2).astype(int) + (boxes[:, 1] <= 2).astype(int)
+                   + (boxes[:, 2] >= W - 2).astype(int) + (boxes[:, 3] >= H - 2).astype(int))
+        keep &= ~((n_edges >= 3) | ((bw > 0.9 * W) & (bh > 0.9 * H)))
         if not keep.any():
             res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
             if return_box:
@@ -401,30 +413,27 @@ class GateYOLOX:
         i = int(idx[np.argmax((bw * bh)[idx])])          # 面積最大の1個
         best = d[i]
         x1, y1, x2, y2 = (float(v) for v in boxes[i])
-        if self.orange_thr > 0 and orange_ratio(img_bgr, (x1, y1, x2, y2)) < self.orange_thr:
+        # ゲート色検証。遠方・斜めのゲートはbbox内に背景(開口越しの暗部)が多くオレンジ率が
+        # 下がるため、面積依存で閾値を緩める: 小box(<4000px²、目安10m超)は0.5×thr。
+        # シアンリボン等の誤検出(実測 area~7400/ratio0.16)は通常サイズ帯なのでフル閾値のまま。
+        orange = orange_ratio(img_bgr, (x1, y1, x2, y2)) if self.orange_thr > 0 else 1.0
+        area_box = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+        thr = self.orange_thr * (0.5 if area_box < 4000.0 else 1.0)
+        if orange < thr:
             res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
             if return_box:
                 res["box"] = (x1, y1, x2, y2)
                 res["score"] = float(best[4] * best[5])
+                res["orange"] = float(orange)
             return res
-        # 至近でゲート枠が画面からはみ出すと bbox がフレームへクリップされ、bbox中心が
-        # 「ほぼ整列」という偽信号になる(実際はズレていても)。学習側 SimGateDetector の
-        # 契約では投影中心が画面外に出た時点で不可視。bboxが画面端の3辺以上に達している=
-        # ゲートが視野を包んでおり真の中心を推定できない状態なので、不可視として扱う
-        # (runs/dcl_fable_0724b の最接近時に center が0.5に張り付いたまま枠へ接触する
-        #  事象の対策。激突直前フレームの実測bbox=(0,0,640,310)は左/上/右の3辺接触)。
-        edges = int(x1 <= 2) + int(y1 <= 2) + int(x2 >= W - 2) + int(y2 >= H - 2)
-        if edges >= 3 or ((x2 - x1) > 0.9 * W and (y2 - y1) > 0.9 * H):
-            res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
-            if return_box:
-                res["box"] = (x1, y1, x2, y2)
-                res["score"] = float(best[4] * best[5])
-            return res
+        # 至近の「視野を覆うbox」(3辺接触/画面9割超)は上のkeepフィルタで既に候補から
+        # 除外済み(bbox中心=(0.5,0.5)という偽の整列信号を防ぐ。学習側契約では投影中心が
+        # 画面外に出た時点で不可視。runs/dcl_fable_0724b の激突事象の対策)。
         cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        area = max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
-        rel = float(np.clip(1.0 - area / self.gate_area_max, 0.0, 1.0))
+        rel = float(np.clip(1.0 - area_box / self.gate_area_max, 0.0, 1.0))
         res = {"visible": 1, "center": (float(cx / W), float(cy / H)), "rel_dist": rel}
         if return_box:
             res["box"] = (x1, y1, x2, y2)
             res["score"] = float(best[4] * best[5])
+            res["orange"] = float(orange)
         return res
