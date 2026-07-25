@@ -21,6 +21,8 @@ cfg.course_seed = 0
 cfg.color_dr = color_dr
 cfg.clutter = True
 cfg.render = RenderConfig(backend="sequential", width=320, height=180)
+cfg.per_env_courses = (len(sys.argv) > 4 and sys.argv[4] == 'perenv')
+cfg.course_pool = 1
 for k in ("dr_mass", "dr_k_rate", "dr_drag", "dr_hover", "dr_inertia", "dr_cmd_gain", "dr_thrust_alpha"):
     setattr(cfg.drone, k, (1.0, 1.0))
 cfg.sensors.noise_scale = 1.0
