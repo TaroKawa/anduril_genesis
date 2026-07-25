@@ -3,14 +3,21 @@
 #   learner=GPU0(専有・巨大replay) / collector=GPU1..7(各1本、Madrona batchレンダ)
 #   コンシューマ2GPUに戻すには hw と env.num_envs / render.backend を元へ。
 env:
-  num_envs: 1536        # per collector。per-env化後の実測スイートスポット(2560に増やすと非固定
-                        # ゲート体×env数で物理/レンダが飽和し逆にスループット低下=978k→805k trans/min)
+  num_envs: 1024        # per collector。per-env(下記per_env_courses)では装飾が非固定ボディになり
+                        # n_dofsが増える。Genesis制約ソルバのJacobian要素数
+                        # (len_constraints_ × n_dofs × n_envs) が int32上限(2.147e9)を超えると
+                        # scene.build()で落ちる。装飾をメッシュ統合(scene_builder._combine_mesh)して
+                        # 非固定ボディ数を~206に抑えた実測(_probe_penv_jac): len_constraints_=1410,
+                        # n_dofs=1242 → per-envコスト1,751,220、num_envs上限=1226。約17%マージンで1024。
+                        # 7×1024=7168 env並列(全て別コース=course_pool)。per-envは定期再構築(=warmup
+                        # 鋸歯)が無く連続稼働するのでlearnerへのデータ供給が安定=学習加速。
   n_gates: 18
   course_seed: 0
   stage: 0              # カリキュラムが自動進級(curriculum.enabled: true)
-  per_env_courses: false # per-env時はリボン/柱/クラッタ/床グローが省かれ、実シム(常にリボン等が
-                         # 映る)との視覚ギャップ源になるためsim2sim段階では無効化。コース多様化は
-                         # 従来のシーン再構築(rebuild_episodes毎、stage4+はseed_poolを循環)で行う
+  per_env_courses: true  # 各envに別コースを同時割当(course_pool種)。stage>=5でのみ有効
+                         # (collector.pyでゲート)。定期シーン再構築(rebuild_episodes/全体再起動=
+                         # warmup鋸歯)を無効化し、コース多様化をenv方向で常時行う。リボン/柱/クラッタ/
+                         # 床グロー/ゲート装飾はメッシュ統合で per-env 復元済み(sim2sim視覚DRを維持)。
   course_pool: 512      # per-env時のコース種類数(0=envごとにユニーク=num_envs種)
   render:
     backend: batch      # gs_madrona(genesis依存に同梱)。ネイティブLinuxで有効
@@ -34,7 +41,9 @@ sac:
   learn_start: 20000
   replay_ratio_cap: 8.0     # learnerのUTD上限(=過学習防止)。7collectorのデータ律速では通常この下で回る
   weight_sync_sec: 1.0      # collectorへactor重みを配る間隔。2.0→1.0で方策の鮮度を上げ探索を改善
-  total_transitions: 500000000  # 学習予算(既定50M)。stage3→5まで学習を続けるため500Mに拡大
+  total_transitions: 1000000000  # 学習予算(既定50M)。latest.ptが既に492M(stage5到達)まで消費済みで、
+                                 # 500Mだと再開直後(残り8M)に予算到達→停止(exit0→再起動→即停止)ループになる。
+                                 # stage5(最終sim2sim堅牢化)をしっかり回すため1Bへ拡大(=stage5に約500Mの余地)。
   compile: true
   encoder_chunk: 384        # DINOv2 forwardを384枚ずつに分割(num_envs=1536を4分割)。全env一括だと
                             # (N,3,224,224)の巨大activationでcollector GPUが80GB上限→OOMクラッシュ。

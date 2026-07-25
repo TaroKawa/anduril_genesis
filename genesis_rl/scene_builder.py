@@ -34,6 +34,9 @@ def ned2w(p) -> tuple:
 
 _T_FLIP = np.diag([1.0, -1.0, -1.0])
 
+# per-envモードの装飾パラメータ(固定サイズ=剛体を再スケールできないため)
+PE_GLOW_COL_H = 6.0   # 床から立てる光柱の固定高[m](ゲート高度差はxy位置のみで吸収)
+
 
 def rot_ned_to_world(R_ned: np.ndarray) -> np.ndarray:
     """NED系の回転行列 → Genesis world系(x軸180°の相似変換)。"""
@@ -128,6 +131,10 @@ class SceneBuilder:
             self._add_ribbon(scene, gs)
             if self.clutter:
                 self._add_clutter(scene, gs)
+        else:
+            # per-env: コース依存の装飾(柱/クラッタ/ポール/オーブ/リボン)を固定個数プールで
+            # 生成し、genesis_race_env が各envのコース配置へ set_pos/set_quat する。
+            self._add_world_pools_per_env(scene, gs)
         self._add_drone(scene, gs, drone_cfg)
         return self.drone_entity
 
@@ -362,6 +369,42 @@ class SceneBuilder:
     # ゲート4バーの面内オフセット(side,up)とサイズ(side,up)。全ゲート共通。
     GATE_BARS = None  # 遅延初期化(モジュール定数から)
 
+    # ---------- per-envメッシュ統合ヘルパー ----------
+    # 装飾を非固定boxで作ると1個=1剛体(6DOF)になり、n_dofsが膨張してGenesisの
+    # int32 Jacobian上限(len_constraints_×n_dofs×n_envs<2^31)でnum_envsが激減する。
+    # 複数box/sphereを1メッシュ(=1剛体)へ統合してDOFを~3倍削り、num_envsを保つ。
+
+    @staticmethod
+    def _combine_mesh(boxes=(), spheres=()):
+        """box/sphere群を1つのtrimeshへ統合。boxes=[(center3,size3,R|None)], spheres=[(center3,r)]。"""
+        import trimesh
+
+        parts = []
+        for (center, size, R) in boxes:
+            T = np.eye(4)
+            if R is not None:
+                T[:3, :3] = R
+            T[:3, 3] = center
+            parts.append(trimesh.creation.box(extents=size, transform=T))
+        for (center, r) in spheres:
+            s = trimesh.creation.icosphere(subdivisions=1, radius=r)
+            s.apply_translation(center)
+            parts.append(s)
+        return trimesh.util.concatenate(parts)
+
+    def _mesh_file(self, tri) -> str:
+        fh = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+        tri.export(fh.name)
+        return fh.name
+
+    def _mesh_ent(self, scene, gs, obj_file, surface):
+        """統合メッシュ(ローカル座標)から非固定・衝突なしの表示エンティティを作る。"""
+        return scene.add_entity(
+            gs.morphs.Mesh(file=obj_file, fixed=False, collision=False,
+                           decimate=False, convexify=False),
+            material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+            surface=surface)
+
     def _add_gates_per_env(self, scene, gs):
         """per-envモード: ゲートを非固定・衝突なしの表示専用ボックスで作る。
 
@@ -371,6 +414,7 @@ class SceneBuilder:
         """
         c = self.colors
         self.glow_entities = []
+        self.glow_col_entities = []
         half = (GATE_INNER + BAR_W) / 2  # 1.05m
         bars = [
             (+half, 0.0, BAR_W, GATE_OUTER),
@@ -378,20 +422,46 @@ class SceneBuilder:
             (0.0, +half, GATE_INNER, BAR_W),
             (0.0, -half, GATE_INNER, BAR_W),
         ]
+        emis = c.gate_rgb
+        halo_col = tuple(min(1.0, v * 0.95) for v in emis)
+        # マークは実映像のYOLOX偽検出源。per-envはメッシュ統合で個数固定=全ゲート共通配置。
+        mark_offsets = [(0.0, 0.6, half), (0.0, -0.5, half), (0.0, 0.0, -half)]
+        # ゲートローカル座標(x=法線/奥行, y=側方, z=上方)で box を並べ、3メッシュへ統合:
+        #   枠(4バー・赤発光) / ハロー(4・半透明赤) / 白(ロゴ+マーク)。各ゲート1エンティティ×3。
+        frame_boxes = [((0.0, os, ou), (GATE_DEPTH, ss, su), None) for (os, ou, ss, su) in bars]
+        halo_boxes = [((0.0, os, ou), (GATE_DEPTH * 0.4, ss * 2.0, su + 0.15), None)
+                      for (os, ou, ss, su) in bars]
+        white_boxes = [((0.0, 0.0, half), (GATE_DEPTH + 0.02, 1.0, 0.16), None)]
+        white_boxes += [((mo[0], mo[1], mo[2]), (GATE_DEPTH + 0.02, 0.35, 0.18), None)
+                        for mo in mark_offsets]
+        frame_f = self._mesh_file(self._combine_mesh(boxes=frame_boxes))
+        halo_f = self._mesh_file(self._combine_mesh(boxes=halo_boxes))
+        white_f = self._mesh_file(self._combine_mesh(boxes=white_boxes))
+        frame_surf = gs.surfaces.Emission(color=tuple(emis))
+        halo_surf = gs.surfaces.Rough(color=tuple(v * 0.2 for v in halo_col),
+                                      emissive=halo_col, opacity=0.14)
+        white_surf = gs.surfaces.Emission(color=(0.95, 0.95, 0.95))
         for gi, gate in enumerate(self.course.gates):
             cw = np.array(ned2w(gate.center_ned))
-            R_w = rot_ned_to_world(gate.rotation_ned())
-            quat = np_R_to_quat(R_w)
-            for (off_side, off_up, size_side, size_up) in bars:
-                pos = cw + R_w @ np.array([0.0, off_side, off_up])
-                ent = scene.add_entity(
-                    gs.morphs.Box(pos=tuple(pos), quat=quat,
-                                  size=(GATE_DEPTH, size_side, size_up),
-                                  fixed=False, collision=False),
-                    material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                    surface=gs.surfaces.Emission(color=tuple(c.gate_rgb)),
-                )
-                self.gate_bar_entities.append((ent, gi, off_side, off_up))
+            # 3メッシュはゲートローカル座標。off=(0,0,0)で登録し、_place_gates_per_env が
+            # ゲート中心へ set_pos・ゲート向き(R_w)へ set_quat する(バーと同じ配置経路)。
+            for fpath, surf in ((frame_f, frame_surf), (halo_f, halo_surf), (white_f, white_surf)):
+                ent = self._mesh_ent(scene, gs, fpath, surf)
+                self.gate_bar_entities.append((ent, gi, (0.0, 0.0, 0.0)))
+            # 床グロー+光柱(非固定box)。build時はcourse[0]配置、_place_glow_per_envがenv毎に移動。
+            self.glow_entities.append(scene.add_entity(
+                gs.morphs.Box(pos=(cw[0], cw[1], 0.02), size=(4.0, 0.7, 0.02),
+                              fixed=False, collision=False),
+                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
+            ))
+            self.glow_col_entities.append(scene.add_entity(
+                gs.morphs.Box(pos=(cw[0], cw[1], PE_GLOW_COL_H / 2),
+                              size=(0.5, 0.5, PE_GLOW_COL_H), fixed=False, collision=False),
+                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                surface=gs.surfaces.Rough(color=tuple(v * 0.2 for v in c.glow_rgb),
+                                          emissive=tuple(c.glow_rgb), opacity=0.4),
+            ))
 
     def _add_ribbon(self, scene, gs):
         """青パス=ゲート内側(中心より下)を貫く帯(半透明フィル＋細い縁レール2本)。
@@ -467,6 +537,155 @@ class SceneBuilder:
             self._static(scene, gs, gs.morphs.Box(pos=(x - 3.0 * np.cos(np.radians(deg)),
                                                        y - 3.0 * np.sin(np.radians(deg)), 1.1),
                                                   euler=(0, 0, deg), size=(1.2, 3.0, 0.9), fixed=True), body)
+
+    # ---------- per-env ワールド配置プール(柱/クラッタ/ポール/リボン) ----------
+    # コース依存の装飾を「固定個数の非固定box/sphereプール」として作り、genesis_race_env が
+    # 各envのコース(_pool_specs)から計算した world pose へ set_pos/set_quat する。未使用スロットは
+    # 床下(-80m)へ沈める。剛体は再スケール不可のためサイズは固定=全コース共通。
+
+    @staticmethod
+    def _quat_z(rad: float) -> tuple:
+        return (float(np.cos(rad / 2)), 0.0, 0.0, float(np.sin(rad / 2)))
+
+    def _pool(self, ents, pos_c, quat_c, valid_c):
+        self.pe_pools.append({
+            "ents": ents,
+            "pos_c": np.asarray(pos_c, np.float32),
+            "quat_c": np.asarray(quat_c, np.float32),
+            "valid_c": np.asarray(valid_c, bool),
+        })
+
+    def _add_world_pools_per_env(self, scene, gs):
+        specs = getattr(self, "_pool_specs", None) or [self.course]
+        K = len(specs)
+        self.pe_pools = []
+        self._pool_pillars(scene, gs, specs, K)
+        if self.clutter:
+            self._pool_clutter(scene, gs, specs, K)
+        self._pool_poles(scene, gs, specs, K)
+        self._pool_ribbon(scene, gs, specs, K)
+
+    def _pool_pillars(self, scene, gs, specs, K):
+        hall = self.course.hall
+        PMAX = 20   # DOF上限: コース毎にリボンへ近い順で最大20本(残りは視界外の壁際で寄与小)
+        # 各コースのリボンに近い順に上位PMAX本を選ぶ
+        sel = []
+        for sp in specs:
+            pil = np.asarray(sp.pillars, float)
+            if len(pil) > PMAX:
+                d = np.linalg.norm(pil[:, None, :] - sp.ribbon_pts[None, :, :2], axis=-1).min(axis=1)
+                pil = pil[np.argsort(d)[:PMAX]]
+            sel.append(pil)
+        n_max = max((len(p) for p in sel), default=0)
+        if n_max == 0:
+            return
+        pos_c = np.zeros((K, n_max, 3), np.float32)
+        quat_c = np.tile(np.array([1.0, 0, 0, 0], np.float32), (K, n_max, 1))
+        valid_c = np.zeros((K, n_max), bool)
+        for c, pil in enumerate(sel):
+            for i, (n, e) in enumerate(pil):
+                pos_c[c, i] = (float(n), float(-e), hall.height / 2)
+                valid_c[c, i] = True
+        ents = [scene.add_entity(
+            gs.morphs.Box(pos=(0, 0, -100), size=(1.5, 1.5, hall.height),
+                          fixed=False, collision=False),
+            material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+            surface=gs.surfaces.Rough(color=(0.05, 0.05, 0.055))) for _ in range(n_max)]
+        self._pool(ents, pos_c, quat_c, valid_c)
+
+    def _pool_clutter(self, scene, gs, specs, K):
+        hall = self.course.hall
+        NA = 8  # 最大駐機機体数(非per-envのrng.integers(4,9)上限)
+        # 機体シルエット=4ボックスを機体ローカル座標で1メッシュへ統合(1機=1剛体)。
+        # 機体poseは (x,y,0) + z回転。z高はメッシュ内に保持(z回転で不変)。
+        ac_boxes = [
+            ((0.0, 0.0, 0.8), (9.0, 1.6, 1.6), None),      # 胴体
+            ((0.0, 0.0, 0.6), (2.5, 7.0, 0.35), None),     # 主翼
+            ((-3.4, 0.0, 1.6), (1.6, 0.25, 1.8), None),    # 垂直尾翼
+            ((-3.0, 0.0, 1.1), (1.2, 3.0, 0.9), None),     # 水平尾翼
+        ]
+        ac_file = self._mesh_file(self._combine_mesh(boxes=ac_boxes))
+        pos_c = np.zeros((K, NA, 3), np.float32)
+        quat_c = np.tile(np.array([1.0, 0, 0, 0], np.float32), (K, NA, 1))
+        valid_c = np.zeros((K, NA), bool)
+        for c, sp in enumerate(specs):
+            rng = np.random.default_rng(int(sp.seed) + 4242)
+            for a in range(NA):
+                for _try in range(20):
+                    n = rng.uniform(-hall.length / 2 + 10, hall.length / 2 - 10)
+                    e = rng.uniform(-hall.width / 2 + 6, hall.width / 2 - 6)
+                    d = np.linalg.norm(sp.ribbon_pts[:, :2] - np.array([n, e]), axis=1).min()
+                    if d > 4.0:
+                        rad = np.radians(float(rng.uniform(0, 360)))
+                        pos_c[c, a] = (float(n), float(-e), 0.0)
+                        quat_c[c, a] = self._quat_z(rad)
+                        valid_c[c, a] = True
+                        break
+        g = 0.16
+        ents = [self._mesh_ent(scene, gs, ac_file,
+                               gs.surfaces.Rough(color=(g, g, g * 1.05))) for _ in range(NA)]
+        self._pool(ents, pos_c, quat_c, valid_c)
+
+    def _pool_poles(self, scene, gs, specs, K):
+        # ゲート脇の信号ポール+発光球。DOF節約のため1ゲート1本(左右交互)、ハロー球は省く。
+        G = self.course.n_gates
+        n = G
+        dist, ph, r_orb = 3.2, 2.1, 0.16
+        pole_pos = np.zeros((K, n, 3), np.float32)
+        orb_pos = np.zeros((K, n, 3), np.float32)
+        ident = np.tile(np.array([1.0, 0, 0, 0], np.float32), (K, n, 1))
+        valid = np.zeros((K, n), bool)
+        for c, sp in enumerate(specs):
+            for gi, gate in enumerate(sp.gates):
+                sgn = 1.0 if gi % 2 == 0 else -1.0
+                base = gate.center_ned + gate.rotation_ned() @ np.array([0.0, sgn * dist, 0.0])
+                w = ned2w(base)
+                pole_pos[c, gi] = (w[0], w[1], ph / 2)
+                orb_pos[c, gi] = (w[0], w[1], ph + r_orb)
+                valid[c, gi] = True
+        pole_ents = [scene.add_entity(
+            gs.morphs.Box(pos=(0, 0, -100), size=(0.07, 0.07, ph), fixed=False, collision=False),
+            material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+            surface=gs.surfaces.Rough(color=(0.04, 0.04, 0.045))) for _ in range(n)]
+        self._pool(pole_ents, pole_pos, ident, valid)
+        cols = [(1.0, 0.55, 0.62) if i % 2 == 0 else (0.45, 1.0, 0.5) for i in range(n)]
+        orb_ents = [scene.add_entity(
+            gs.morphs.Sphere(pos=(0, 0, -100), radius=r_orb, fixed=False, collision=False),
+            material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+            surface=gs.surfaces.Emission(color=cols[i])) for i in range(n)]
+        self._pool(orb_ents, orb_pos, ident, valid)
+
+    def _pool_ribbon(self, scene, gs, specs, K):
+        from .course import ribbon_dashes
+
+        # DOF節約のため粗い間隔(5.0m)。ダッシュ長4.8mでほぼ連続に見える(緩曲線では逸脱小)。
+        dashes = [ribbon_dashes(sp, spacing=5.0) for sp in specs]
+        n_max = max((len(d[0]) for d in dashes), default=0)
+        if n_max == 0:
+            return
+        pos_c = np.zeros((K, n_max, 3), np.float32)
+        quat_c = np.tile(np.array([1.0, 0, 0, 0], np.float32), (K, n_max, 1))
+        valid_c = np.zeros((K, n_max), bool)
+        up = np.array([0.0, 0.0, -1.0])   # NEDの上
+        for c, (pos, tan) in enumerate(dashes):
+            for i in range(len(pos)):
+                t = tan[i]
+                side = np.cross(t, up)
+                ns = np.linalg.norm(side)
+                side = side / ns if ns > 0.2 else np.array([0.0, 1.0, 0.0])
+                nrm = np.cross(t, side)
+                nrm /= np.linalg.norm(nrm) + 1e-9
+                R_ned = np.stack([t, side, nrm], axis=1)          # 列=(接線,側方,法線)
+                quat_c[c, i] = np_R_to_quat(rot_ned_to_world(R_ned))
+                pos_c[c, i] = ned2w(pos[i])
+                valid_c[c, i] = True
+        r, g, b = self.colors.ribbon_rgb
+        ents = [scene.add_entity(
+            gs.morphs.Box(pos=(0, 0, -100), size=(3.4, 1.3, 0.06), fixed=False, collision=False),
+            material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+            surface=gs.surfaces.Rough(color=(r * 0.2, g * 0.2, b * 0.2),
+                                      emissive=(r, g, b), opacity=0.9)) for _ in range(n_max)]
+        self._pool(ents, pos_c, quat_c, valid_c)
 
     def _add_drone(self, scene, gs, drone_cfg):
         # Box剛体(280x280x160mm)。密度で質量を合わせる(力は比力×質量で印加するので

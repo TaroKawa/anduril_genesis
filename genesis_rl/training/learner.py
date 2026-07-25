@@ -38,6 +38,7 @@ class Learner:
         self.stage = 0
         self.best_gates = -1.0
         self.best_return = -1e18
+        self._best_return_loaded = False  # best_return.pt の記録値をstage5で一度だけ読み戻す
         self._last_ckpt = time.time()
 
     def add_transitions(self, batch: dict, success: bool = False):
@@ -92,10 +93,33 @@ class Learner:
                 self.best_gates = g
                 save_checkpoint(ckpt_dir / "best_gates.pt", self.agent, learner_step=self.updates,
                                 env_transitions=self.transitions, stage=self.stage, cfg_snapshot=snap)
-            if r > self.best_return:
-                self.best_return = r
-                save_checkpoint(ckpt_dir / "best_return.pt", self.agent, learner_step=self.updates,
-                                env_transitions=self.transitions, stage=self.stage, cfg_snapshot=snap)
+            # best_return は最終堅牢化ステージ(stage5)でのみ更新・保存する。return_mean は
+            # コース/報酬がステージごとに違うため比較不能で、旧stageの高リターンが残ると
+            # stage5では二度と更新されず陳腐化する。stage5内のベストだけを残す。
+            # コンテナ再起動(カリキュラム再構築/ストール)をまたいでも、既存の
+            # best_return.pt が stage5 で記録した値を読み戻して基準にし、再起動直後の
+            # 低リターンで上書きしないようにする。
+            if self.stage >= 5:
+                if not self._best_return_loaded:
+                    self._load_best_return(ckpt_dir / "best_return.pt")
+                if r > self.best_return:
+                    self.best_return = r
+                    save_checkpoint(ckpt_dir / "best_return.pt", self.agent, learner_step=self.updates,
+                                    env_transitions=self.transitions, stage=self.stage,
+                                    cfg_snapshot=snap, extra={"best_return": r})
+
+    def _load_best_return(self, path: Path):
+        """stage5で記録済みの best_return.pt があればその基準値を読み戻す。
+        旧stage由来(best_return未記録 or stage<5)の値は比較不能なので採用しない。"""
+        self._best_return_loaded = True
+        if not path.exists():
+            return
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return
+        if int(payload.get("stage", -1)) >= 5 and "best_return" in payload:
+            self.best_return = float(payload["best_return"])
 
     def update_success_ratio(self, stage: int):
         # Stage3以降(フルコースを安定通過)は成功バッファ依存を下げる

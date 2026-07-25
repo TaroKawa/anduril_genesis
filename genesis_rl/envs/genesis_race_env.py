@@ -97,6 +97,7 @@ class GenesisRaceEnv:
         rendered_idx = self.rig.rendered_envs_idx() or [0]
 
         amb = SceneBuilder(self.course, rng, cfg.color_dr, cfg.clutter, per_env=self.per_env)
+        amb._pool_specs = self.pool_specs   # per-env装飾(柱/クラッタ/ポール/リボン)の全コース配置用
         self.builder = amb
         # 屋内シーン。ポイントライトは8192^2キューブシャドウマップを確保しVRAMを食い潰す
         # ため使わない。天井スラブは非表示(衝突のみ)にして平行光を屋内に届かせる
@@ -134,6 +135,7 @@ class GenesisRaceEnv:
             self._attach_extra_cameras()
         if self.per_env:
             self._place_gates_per_env()
+            self._place_world_pools_per_env()
 
         # --- モデル・センサー ---
         self.drone = DroneModel(self.drone_entity, self.scene.rigid_solver, cfg.drone, self.signs,
@@ -247,8 +249,8 @@ class GenesisRaceEnv:
                 gl.append((cw, R_w, q))
             spec_gate.append(gl)
         env2c = self.env2course                                  # (N,)
-        for (ent, gi, off_side, off_up) in bars:
-            off = np.array([0.0, off_side, off_up], dtype=np.float64)
+        for (ent, gi, off3) in bars:
+            off = np.asarray(off3, dtype=np.float64)             # (normal, side, up) ゲート面内
             pos_c = np.stack([spec_gate[c][gi][0] + spec_gate[c][gi][1] @ off
                               for c in range(len(specs))]).astype(np.float32)   # (K,3)
             quat_c = np.stack([spec_gate[c][gi][2]
@@ -260,6 +262,76 @@ class GenesisRaceEnv:
             # (_all_idxはbuffer節で後から定義されるため、ここでは早期定義の_env_arを使う)
             ent.set_pos(pos, envs_idx=self._env_ar, zero_velocity=True, relative=False)
             ent.set_quat(quat, envs_idx=self._env_ar, zero_velocity=True, relative=False)
+
+        self._place_glow_per_env(spec_gate, env2c)
+
+    def _place_glow_per_env(self, spec_gate, env2c):
+        """床グロー+光柱を各envのコース配置へ置き、per-env home を保存する。
+
+        glow/col はアクティブゲートのみ点灯する動的表示なので、_update_glow が使う
+        per-env home テンソル (_glow_home_penv / _glow_col_home_penv) をここで確定する
+        (非per-envのように env0 の pose を共有すると各envのゲート位置がずれる)。
+        """
+        from ..scene_builder import PE_GLOW_COL_H
+
+        glows = getattr(self.builder, "glow_entities", [])
+        cols = getattr(self.builder, "glow_col_entities", [])
+        if not glows:
+            return
+        dev = self.device
+        K = len(spec_gate)
+        G = len(spec_gate[0]) if K else 0
+        # コース毎・ゲート毎の glow/col world中心 と z回転quat
+        glow_pos_c = np.zeros((K, G, 3), np.float32)
+        col_pos_c = np.zeros((K, G, 3), np.float32)
+        quat_c = np.zeros((K, G, 4), np.float32)
+        for c in range(K):
+            for gi in range(G):
+                cw, R_w, _ = spec_gate[c][gi]
+                nrm = R_w[:, 0]
+                ang = float(np.arctan2(nrm[1], nrm[0]))
+                glow_pos_c[c, gi] = (cw[0], cw[1], 0.02)
+                col_pos_c[c, gi] = (cw[0], cw[1], PE_GLOW_COL_H / 2.0)
+                quat_c[c, gi] = (np.cos(ang / 2), 0.0, 0.0, np.sin(ang / 2))
+        glow_home = torch.tensor(glow_pos_c[env2c], device=dev)   # (N,G,3)
+        col_home = torch.tensor(col_pos_c[env2c], device=dev)     # (N,G,3)
+        quat = torch.tensor(quat_c[env2c], device=dev)            # (N,G,4)
+        self._glow_home_penv = glow_home
+        self._glow_col_home_penv = col_home
+        for k in range(G):
+            glows[k].set_pos(glow_home[:, k], envs_idx=self._env_ar,
+                             zero_velocity=True, relative=False)
+            glows[k].set_quat(quat[:, k], envs_idx=self._env_ar,
+                              zero_velocity=True, relative=False)
+            if k < len(cols):
+                cols[k].set_pos(col_home[:, k], envs_idx=self._env_ar,
+                                zero_velocity=True, relative=False)
+                cols[k].set_quat(quat[:, k], envs_idx=self._env_ar,
+                                 zero_velocity=True, relative=False)
+
+    def _place_world_pools_per_env(self):
+        """柱/クラッタ/ポール/オーブ/リボンダッシュのプールを各envのコース配置へ置く。
+
+        builder.pe_pools 各要素は {ents, pos_c(K,n,3), quat_c(K,n,4), valid_c(K,n)}。
+        env2course で各envのコース値を gather し、未使用スロット(valid=False)は床下へ沈める。
+        全て build 時1回のみ(装飾はエピソード中に動かない=静的)。
+        """
+        pools = getattr(self.builder, "pe_pools", [])
+        if not pools:
+            return
+        dev = self.device
+        env2c = self.env2course
+        for pool in pools:
+            ents = pool["ents"]
+            pos_n = pool["pos_c"][env2c].copy()       # (N,n,3)
+            quat_n = pool["quat_c"][env2c]            # (N,n,4)
+            valid_n = pool["valid_c"][env2c]          # (N,n)
+            pos_n[~valid_n, 2] = -80.0                # 未使用スロットは床下へ
+            pos_t = torch.tensor(pos_n, device=dev)
+            quat_t = torch.tensor(quat_n, device=dev)
+            for i, ent in enumerate(ents):
+                ent.set_pos(pos_t[:, i], envs_idx=self._env_ar, zero_velocity=True, relative=False)
+                ent.set_quat(quat_t[:, i], envs_idx=self._env_ar, zero_velocity=True, relative=False)
 
     # --- 追加カメラ(preview用) ---
 
@@ -573,9 +645,13 @@ class GenesisRaceEnv:
         cols = getattr(self.builder, "glow_col_entities", [])
         if not glows or len(envs_idx) == 0:
             return
-        if not hasattr(self, "_glow_home"):
+        # per-env(コースがenv毎に違う)は _place_glow_per_env が確定した per-env home を使う。
+        # 非per-envは全env同一コースなので env0 の pose を共有ホームにする(従来挙動)。
+        penv = hasattr(self, "_glow_home_penv")
+        if not penv and not hasattr(self, "_glow_home"):
             self._glow_home = [g.get_pos()[0].clone() for g in glows]
             self._glow_col_home = [g.get_pos()[0].clone() for g in cols]
+        if not hasattr(self, "_glow_vis"):
             self._glow_vis = torch.ones(self.num_envs, len(glows),
                                         device=self.device, dtype=torch.bool)
         active = self.active_gate[envs_idx]
@@ -587,11 +663,12 @@ class GenesisRaceEnv:
             d = diff_all[:, k]
             idx = envs_idx[d]
             vis = vis_all[d, k]
-            home = self._glow_home[k].expand(len(idx), 3)
+            home = self._glow_home_penv[idx, k] if penv else self._glow_home[k].expand(len(idx), 3)
             glows[k].set_pos(torch.where(vis.unsqueeze(1), home, home + sink),
                              envs_idx=idx, zero_velocity=True, relative=False)
             if k < len(cols):
-                col_home = self._glow_col_home[k].expand(len(idx), 3)
+                col_home = self._glow_col_home_penv[idx, k] if penv \
+                    else self._glow_col_home[k].expand(len(idx), 3)
                 cols[k].set_pos(torch.where(vis.unsqueeze(1), col_home, col_home + sink),
                                 envs_idx=idx, zero_velocity=True, relative=False)
             self._glow_vis[idx, k] = vis

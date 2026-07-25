@@ -337,6 +337,32 @@ def path_segments(spec: CourseSpec, rail_half: float = 0.6, rail_w: float = 0.06
     return segs
 
 
+def ribbon_dashes(spec: CourseSpec, spacing: float = 1.6, drop: float = 0.4,
+                  ahead: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
+    """青パスを弧長等間隔の短いダッシュ点列へ再サンプルする(per-env box配置用)。
+
+    per-envモードでは連続曲線メッシュを剛体で移動できない(曲率がコース毎に違う)ため、
+    固定サイズの短いboxダッシュを弧長沿いに並べて青パスを近似する。中心線をdropだけ
+    下げ(実パス同様ゲート内側の下寄り)、各ダッシュの中心位置と単位接線を返す。
+    returns (pos_ned (nd,3), tan_ned (nd,3))。nd = ceil(total_arc/spacing)。
+    """
+    pts = spec.ribbon_pts.astype(float).copy()
+    pts[:, 2] += drop
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total < 1e-6:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    s = np.arange(spacing * 0.5, total, spacing)                 # ダッシュ中心の弧長位置
+    pos = np.stack([np.interp(s, cum, pts[:, j]) for j in range(3)], axis=1)
+    posf = np.stack([np.interp(np.clip(s + ahead, 0.0, total), cum, pts[:, j])
+                     for j in range(3)], axis=1)
+    tan = posf - pos
+    tn = np.linalg.norm(tan, axis=1, keepdims=True)
+    tan = np.where(tn > 1e-6, tan / np.maximum(tn, 1e-9), np.array([1.0, 0.0, 0.0]))
+    return pos, tan
+
+
 def ribbon_mesh(ribbon_pts: np.ndarray, width: float = 0.8,
                 thickness: float = 0.03) -> tuple[np.ndarray, np.ndarray]:
     """リボン(発光ガイドパス)の薄い角柱メッシュを生成。NED座標のまま返す。
