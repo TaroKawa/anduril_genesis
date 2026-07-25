@@ -113,7 +113,8 @@ class SceneBuilder:
         self.colors = sample_colors(rng, color_dr)
         self.clutter = clutter
         # per_env: ゲートを非固定・衝突なしの表示専用ボックスにし、envごとにset_pos/set_quatで
-        # 別コースへ配置し直す(衝突は数値計算)。コース依存メッシュのリボン/柱/クラッタは省く。
+        # 別コースへ配置し直す(衝突は数値計算)。コース依存の装飾(柱/看板/クラッタ/ポール/
+        # リボン)は _add_world_pools_per_env が固定個数プールで復元し per-env 化する(省かない)。
         self.per_env = per_env
         self.drone_entity = None
         self.static_entities = []
@@ -560,6 +561,7 @@ class SceneBuilder:
         K = len(specs)
         self.pe_pools = []
         self._pool_pillars(scene, gs, specs, K)
+        self._pool_signs(scene, gs, specs, K)   # 柱の"Station"看板(DCLのゲート間の明るい縦帯)
         if self.clutter:
             self._pool_clutter(scene, gs, specs, K)
         self._pool_poles(scene, gs, specs, K)
@@ -591,6 +593,50 @@ class SceneBuilder:
                           fixed=False, collision=False),
             material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
             surface=gs.surfaces.Rough(color=(0.05, 0.05, 0.055))) for _ in range(n_max)]
+        self._pool(ents, pos_c, quat_c, valid_c)
+
+    def _pool_signs(self, scene, gs, specs, K):
+        # "Station XX"看板: 柱面の高所に付く白い発光ストリップ。DCLでは旋回中に視界へ入る
+        # 明るい縦帯で、これが未学習だと機体がゲート光/上昇手掛かりと誤認して見上げやすい。
+        # 剛体は再スケール不可のためサイズ固定=(0.06,0.5,2.6)。面(±x/±y)はz回転、高さは中心zで表現。
+        # DOF上限(int32 Jacobian, [[stage5-jacobian-env-cap]])のためリボン近傍上位NSの柱のみに付ける。
+        hall = self.course.hall
+        NS = 8   # int32 Jacobian余裕(既存206ボディ/cap1226)を保つ本数。増やす前に上限を再測定
+        q0 = np.array([1.0, 0.0, 0.0, 0.0], np.float32)
+        qz = np.array([float(np.cos(np.pi / 4)), 0.0, 0.0, float(np.sin(np.pi / 4))], np.float32)
+        faces = [(0.78, 0.0, False), (-0.78, 0.0, False),
+                 (0.0, 0.78, True), (0.0, -0.78, True)]     # (dx, dy, rot90) 世界座標の柱面
+        sel = []
+        for sp in specs:
+            pil = np.asarray(sp.pillars, float)
+            if len(pil) > NS:
+                d = np.linalg.norm(pil[:, None, :] - sp.ribbon_pts[None, :, :2], axis=-1).min(axis=1)
+                pil = pil[np.argsort(d)[:NS]]
+            sel.append(pil)
+        n_max = min(NS, max((len(p) for p in sel), default=0))
+        if n_max == 0:
+            return
+        pos_c = np.zeros((K, n_max, 3), np.float32)
+        quat_c = np.tile(q0, (K, n_max, 1))
+        valid_c = np.zeros((K, n_max), bool)
+        for c, pil in enumerate(sel):
+            rng = np.random.default_rng(int(specs[c].seed) + 9137)
+            for i in range(min(len(pil), n_max)):
+                if rng.random() >= 0.75:              # _add_pillars と同じ看板出現率
+                    continue
+                n, e = float(pil[i][0]), float(pil[i][1])
+                dx, dy, rot = faces[int(rng.integers(0, 4))]
+                zc = float(rng.uniform(4.0, hall.height - 2.0))
+                pos_c[c, i] = (n + dx, -e + dy, zc)
+                quat_c[c, i] = qz if rot else q0
+                valid_c[c, i] = True
+        ents = []
+        for _ in range(n_max):
+            v = float(self.rng.uniform(0.32, 0.52))       # スロット毎に固定の明度(全env共通)
+            ents.append(scene.add_entity(
+                gs.morphs.Box(pos=(0, 0, -100), size=(0.06, 0.5, 2.6), fixed=False, collision=False),
+                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
+                surface=gs.surfaces.Emission(color=(v, v, v * 1.02))))
         self._pool(ents, pos_c, quat_c, valid_c)
 
     def _pool_clutter(self, scene, gs, specs, K):

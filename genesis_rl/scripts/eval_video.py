@@ -50,12 +50,14 @@ class LegacyActor(nn.Module):
 class LoadedPolicy:
     """ckptからactor+エンコーダを復元し、単一envの推論(履歴管理込み)を提供する。"""
 
-    def __init__(self, ckpt_path: str, device: torch.device, num_envs: int = 1):
+    def __init__(self, ckpt_path: str, device: torch.device, num_envs: int = 1,
+                 deterministic: bool = True):
         from .. import contracts as C
         from ..models.encoder import FrozenDINOv2, FrozenResNet18
 
         self.C = C
         self.device = device
+        self.deterministic = deterministic
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         self.cfg_snapshot = payload.get("cfg") or {}  # 学習時設定(dcl/client.pyのゲイン自動判別に使う)
         sd = payload["agent"]["actor"]
@@ -80,13 +82,13 @@ class LoadedPolicy:
     def act(self, rgb_u8: torch.Tensor, vec: torch.Tensor, done_prev: torch.Tensor | None = None):
         feat = self.encoder(self.C.to_resnet(rgb_u8))
         if self.legacy:
-            return self.actor.act(feat, vec, deterministic=True)
+            return self.actor.act(feat, vec, deterministic=self.deterministic)
         if done_prev is not None and done_prev.any():
             self.feat_hist[done_prev, :] = 0.0
             self.vec_hist[done_prev, :] = 0.0
         self.feat_hist = torch.cat([self.feat_hist[:, 1:], feat.unsqueeze(1)], dim=1)
         self.vec_hist = torch.cat([self.vec_hist[:, 1:], vec.unsqueeze(1)], dim=1)
-        return self.actor.act(self.feat_hist, self.vec_hist, deterministic=True)
+        return self.actor.act(self.feat_hist, self.vec_hist, deterministic=self.deterministic)
 
 
 def main():
@@ -97,6 +99,8 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--duration", type=float, default=40.0)
     ap.add_argument("--noise", type=float, default=0.6, help="センサーノイズスケール")
+    ap.add_argument("--stochastic", action="store_true",
+                    help="方策をtanh-Gaussianからサンプリング(既定=決定論的)")
     args = ap.parse_args()
 
     import cv2
@@ -118,7 +122,9 @@ def main():
     cfg.max_episode_s = 120.0
 
     env = GenesisRaceEnv(cfg, num_envs=1, extra_cameras=True)
-    policy = LoadedPolicy(args.ckpt, env.device, num_envs=1)
+    print(f"[eval] policy sampling: {'stochastic (tanh-Gaussian)' if args.stochastic else 'deterministic (mean)'}")
+    policy = LoadedPolicy(args.ckpt, env.device, num_envs=1,
+                          deterministic=not args.stochastic)
     obs, priv = env.reset()
 
     hall = env.course.hall

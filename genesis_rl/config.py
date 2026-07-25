@@ -118,8 +118,9 @@ class EnvConfig:
     clutter: bool = False                 # 駐機機体クラッタ(Stage3+)
     # per-envコース: 各並列envに異なるゲート配置を割り当てる(stage>=5でのみ有効)。
     # ゲートは非固定・表示専用ボックスとしてenvごとにset_pos/set_quatで配置し、
-    # 衝突はコードで数値計算(物理接触ではない)。リボン/柱/クラッタは非表示(=コース依存
-    # メッシュのため per-env 化不可)。6000エピソード再構築に頼らず多様なコースを最初から適用する。
+    # 衝突はコードで数値計算(物理接触ではない)。リボン/柱/看板/クラッタ/ポールはメッシュ統合
+    # プールで per-env 復元済み(scene_builder._add_world_pools_per_env)。定期再構築に頼らず
+    # 多様なコースを最初から適用する。
     per_env_courses: bool = False
     course_pool: int = 0                  # per-env時のコース種類数。0=envごとにユニーク(num_envs種)
 

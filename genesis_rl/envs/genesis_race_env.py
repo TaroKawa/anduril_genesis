@@ -227,6 +227,19 @@ class GenesisRaceEnv:
             np.array([max(specs[c].total_arc, 1e-6) for c in env2course], dtype=np.float32),
             device=dev)                                                            # (N,)
 
+        # 青パス(ribbon)を粗くダウンサンプルして per-env 保持(進路追従シェイピング用)。
+        # 全コースは同一ゲート数=同一サンプル数なので固定長でstackできる。
+        RIB_STRIDE = 8
+        rds = [np.asarray(sp.ribbon_pts, np.float32)[::RIB_STRIDE] for sp in specs]
+        Md = min(len(r) for r in rds)
+        rds = np.stack([r[:Md] for r in rds])                                      # (K,Md,3)
+        self.ribbon_ds = torch.tensor(rds[env2course], device=dev)                 # (N,Md,3) NED
+        self._path_lead = 2   # 先読み点数(ds間隔≈stride×0.25m=2m → ~4m先)
+        tilt = math.radians(C.CAM_TILT_DEG)
+        self._cam_axis = torch.tensor([math.cos(tilt), 0.0, -math.sin(tilt)],
+                                      device=dev)                                  # FRD: 前方+上tilt
+        self._cos_fov = math.cos(math.radians(50.0))   # 視野±50°をゆるく視界内とみなす閾
+
     def _place_gates_per_env(self):
         """build後、per-envのゲート表示ボックスを各envのコース配置へ move する。
 
@@ -487,9 +500,10 @@ class GenesisRaceEnv:
         # --- 報酬 ---
         d_now = (state["pos_ned"] - gp).norm(dim=1)
         episode_t = self.episode_steps.float() * C.DT_PHYS
+        path_view = self._path_view(state["pos_ned"], state["quat_ned"])
         reward = self.rewards.compute(
             gate_pass=self.gate_pass_flag, finish=finish, collision=self.collision,
-            d_prev=self.d_prev, d_now=d_now, closeness=closeness,
+            d_prev=self.d_prev, d_now=d_now, closeness=closeness, path_view=path_view,
             action=actions, last_action=self.last_action,
             omega_norm=state["omega_frd"].norm(dim=1), wrong_way=self.wrong_way_flag,
             episode_t=episode_t, max_episode_s=cfg.max_episode_s,
@@ -535,6 +549,23 @@ class GenesisRaceEnv:
         return obs, priv, reward, done, info
 
     # --- 内部 ---
+
+    def _path_view(self, pos, quat):
+        """機体近傍の青パス(ribbon)の少し先の点が、カメラ視野中心に近いほど1に近い値(N,)∈[0,1]。
+
+        ゲートが柱裏/軸外で見えない旋回中でも密な航法シェイピングを与える。特権情報(ribbon幾何)を
+        使うが観測ではないためDCL転移に影響しない。学習される行動「進路方向を視野に入れ続ける」は
+        リボンの無いDCLでも有効(=次ゲートへ向く)。
+        """
+        rb = self.ribbon_ds                                  # (N,Md,3) NED
+        d = (rb - pos.unsqueeze(1)).pow(2).sum(dim=2)        # (N,Md) 各ds点までの距離^2
+        j = d.argmin(dim=1)                                  # 最近点
+        jl = (j + self._path_lead).clamp(max=rb.shape[1] - 1)   # 少し先の点
+        tgt = rb[self._env_ar, jl]                           # (N,3) 先読み点
+        rel_body = quat_rotate_inv(quat, tgt - pos)          # 機体FRDでの方向
+        rel_body = rel_body / (rel_body.norm(dim=1, keepdim=True) + 1e-6)
+        cos_ang = (rel_body * self._cam_axis).sum(dim=1)     # カメラ光軸との内積(=中心度)
+        return ((cos_ang - self._cos_fov) / (1.0 - self._cos_fov)).clamp(0.0, 1.0)
 
     def _check_gate_pass(self, state, finish: torch.Tensor):
         act = self.active_gate.clamp(max=self.n_gates - 1)

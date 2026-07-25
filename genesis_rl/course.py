@@ -110,7 +110,9 @@ class CourseGenerator:
     def generate(self) -> CourseSpec:
         for attempt in range(64):
             rng = np.random.default_rng(self.seed + attempt * 1000)
-            spec = self._try_generate(rng)
+            # ブラインド旋回は生成を難しくする。前半40試行のみ強制し、詰まったseedは
+            # ブラインドなし(sharp_pのみ)で必ず生成できるようフォールバックする。
+            spec = self._try_generate(rng, force_blind=attempt < 40)
             if spec is not None:
                 spec.seed = self.seed
                 return spec
@@ -136,11 +138,14 @@ class CourseGenerator:
             return dict(dpsi_max=np.radians(40), z_range=(1.5, 3.5), climbs=0,
                         n_gates=self.n_gates, seg=(7.0, 13.0),
                         tilt=np.radians(5), sharp_p=0.1, min_gap=6.0)
-        return dict(dpsi_max=np.radians(90), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
+        # フルレンジ: DCL相当の急旋回を増やす。dpsi_max=110°(ゲートyawは進入/退出の円平均なので
+        # 110°ターンでも各面55°<70°で通過可)、sharp_p=0.4。blind=Trueで通過直後に次ゲートが
+        # 視界外(HFOV=90°/±45°、110°ターンで平行姿勢からbearing≈55°)へ出る旋回を強制する。
+        return dict(dpsi_max=np.radians(110), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
                     n_gates=self.n_gates, seg=(6.0, 13.0),
-                    tilt=np.radians(12), sharp_p=0.25, min_gap=6.0)
+                    tilt=np.radians(12), sharp_p=0.4, min_gap=6.0, blind=True)
 
-    def _try_generate(self, rng) -> CourseSpec | None:
+    def _try_generate(self, rng, force_blind: bool = True) -> CourseSpec | None:
         """始点(ホール手前)→終点(奥)へ縦方向に進行するコース。
 
         方位ψは+N基準で±95°にクランプ(後戻りしない=縦方向に伸びる)。
@@ -164,6 +169,18 @@ class CourseGenerator:
         climb_idx = set(rng.choice(np.arange(3, n_gates - 1), size=p["climbs"], replace=False).tolist()) \
             if p["climbs"] > 0 else set()
 
+        # ブラインドゲート: 通過直後、ゲート面と平行な姿勢では次ゲートが視界外(HFOV=90°=±45°)に
+        # なる急旋回を課す(DCLのゲート1直後「柱裏へ右90°→旋回中ゲート2が見えない」を再現)。
+        # 早期(ゲート2..4)に必ず1つ入れ、以降にも散らす。真横~やや後退の横断を許すため
+        # 該当ゲートは後退許容を緩める(下の back_allow)。
+        blind_idx = set()
+        if p.get("blind") and force_blind and n_gates >= 4:
+            blind_idx.add(int(rng.integers(2, 5)))
+            k = min(2, max(0, n_gates - 4))
+            if k > 0:
+                blind_idx.update(int(x) for x in
+                                 rng.choice(np.arange(4, n_gates + 1), size=k, replace=False).tolist())
+
         for i in range(1, n_gates + 1):
             ok = False
             for retry in range(60):
@@ -172,10 +189,11 @@ class CourseGenerator:
                 remaining_n = max(far_limit - prev[0], 1.0)
                 target_dn = remaining_n / (n_gates - i + 1)
 
-                # ターン角: 通常は予算から導出±ノイズ、確率的に~90°の急ターン(真横)
+                # ターン角: 通常は予算から導出±ノイズ、確率的に~90°の急ターン(真横)。
+                # blind_idx のゲートは必ず最大級の旋回にし、次ゲートを視界外へ出す。
                 base = np.arccos(np.clip(target_dn / p["seg"][1], 0.05, 0.98))
-                if rng.random() < p["sharp_p"]:
-                    mag = rng.uniform(0.8, 1.0) * p["dpsi_max"]
+                if i in blind_idx or rng.random() < p["sharp_p"]:
+                    mag = rng.uniform(0.85, 1.0) * p["dpsi_max"]
                 else:
                     mag = np.clip(base + rng.uniform(-0.5, 0.5), 0.0, p["dpsi_max"])
                 # 横方向の符号: 慣性 or ランダム、壁際では中央へ
@@ -196,7 +214,10 @@ class CourseGenerator:
                 L = float(np.clip(target_dn / cos_p * rng.uniform(0.8, 1.3), *p["seg"]))
 
                 cand = prev + np.array([L * np.cos(psi_new), L * np.sin(psi_new), 0.0])
-                if cand[0] < prev[0] - 1.0:  # 縦方向にほぼ単調(後戻り禁止)
+                # 縦方向にほぼ単調(後戻り禁止)。blindゲートは真横~やや後退の横断を許す
+                # (DCLのゲート1直後に横へ抜ける動きを許容)。
+                back_allow = 5.0 if i in blind_idx else 1.0
+                if cand[0] < prev[0] - back_allow:
                     continue
                 if i in climb_idx:
                     # 急上昇/急降下: 天井近く(~7m)まで、または低空へ

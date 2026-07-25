@@ -11,7 +11,7 @@
 
 # --- アクションマッピング(方策 a∈[-1,1]^4 → 物理指令)。contracts.py ---
 action:
-  rate_limits:    [1.0, 1.0, 1.0]   # roll/pitch/yaw の指令レート上限 [rad/s](a=±1で±これ)
+  rate_limits:    [5.0, 5.0, 5.0]   # roll/pitch/yaw の指令レート上限 [rad/s](a=±1で±これ)
   thrust_center:  0.2694            # a3=0 の推力(=ホバー)
   thrust_halfspan: 0.0306           # → thrust ∈ [0.2388, 0.30]。下端=下降、上端=上昇
   hover_thrust:   0.2742            # A==g 参考値(フェイルセーフ/逆写像用)
@@ -19,7 +19,7 @@ action:
 
 # --- 観測スケール & ゲート検出。contracts.py ---
 observation:
-  rate_scale:        4.0            # gyro 正規化 [rad/s]
+  rate_scale:        6.0            # gyro 正規化 [rad/s](rate_limits ±5 / rate_max 6 に整合)
   accel_scale:       25.0           # accel 正規化 [m/s^2]
   v_scale:           15.0           # 特権 velocity [m/s]
   pos_scale:         60.0           # 特権 position [m]
@@ -52,7 +52,7 @@ dynamics:
   hover_thrust: 0.2694              # A = g*(t/0.2694)^1.84
   thrust_alpha: 1.84
   drag_c:       0.64                # 線形ドラッグ
-  rate_max:     4.0                 # 内部レート目標クランプ [rad/s]
+  rate_max:     6.0                 # 内部レート目標クランプ [rad/s](rate_limits ±5 を切らないよう余裕)
 
 # --- ドメインランダム化(エピソード毎の倍率レンジ)。config.py DroneConfig ---
 domain_rand:

@@ -14,8 +14,10 @@ class RewardWeights:
     collision: float = -20.0  # 衝突ペナルティ(終端)
     approach: float = 1.0     # 接近報酬 [m^-1](d_prev - d_now)
     closeness: float = 0.05   # 視覚closeness(ゲートが見えている間の密報酬)
+    path: float = 0.08        # 青パス追従(特権): 進路先読み点を視野中心に保つ密報酬 ∈[0,1]。
+                              # ゲートが柱裏/軸外で見えない旋回中でも航法手掛かりを与える
     smooth: float = -0.02     # アクション平滑化 ‖Δa‖²
-    rate: float = -0.01       # レートペナルティ (‖ω‖/4)²
+    rate: float = -0.01       # レートペナルティ (‖ω‖/6)²(rate_max=6 に整合)
     wrong_way: float = -5.0   # 逆走(非終端)
     speed_finish: float = 0.0 # Stage4: 完走時間ボーナス w*(60-T)/60(カリキュラムが設定)
     approach_clip: float = 3.0  # 1決定あたりの接近クリップ [m]
@@ -42,6 +44,7 @@ class RewardComputer:
         d_prev: torch.Tensor,         # (N,) 前決定時のアクティブゲートまでの距離 [m]
         d_now: torch.Tensor,          # (N,)
         closeness: torch.Tensor,      # (N,) (1 - rel_dist_true) * visible ∈ [0,1]
+        path_view: torch.Tensor,      # (N,) 進路先読み点(青パス)の視野内中心度 ∈ [0,1]
         action: torch.Tensor,         # (N,4) [-1,1]
         last_action: torch.Tensor,    # (N,4)
         omega_norm: torch.Tensor,     # (N,) ‖ω‖ [rad/s]
@@ -58,8 +61,11 @@ class RewardComputer:
             "approach": w.approach
             * torch.where(gate_pass, torch.zeros_like(d_now), (d_prev - d_now).clamp(-w.approach_clip, w.approach_clip)),
             "closeness": w.closeness * closeness,
+            # 青パス追従: 進路先読み点が視野中心にあるほど密に加点(通過後はゲート同様スキップしない
+            # ＝旋回中も継続的に手掛かりを与える)。finish後は0にして完走の速度志向を邪魔しない。
+            "path": w.path * path_view * (~finish).float(),
             "smooth": w.smooth * (action - last_action).pow(2).sum(dim=1),
-            "rate": w.rate * (omega_norm / 4.0).pow(2),
+            "rate": w.rate * (omega_norm / 6.0).pow(2),
             "wrong_way": w.wrong_way * wrong_way.float(),
             "speed_finish": w.speed_finish
             * finish.float()
