@@ -14,10 +14,20 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .contracts import CAM_TILT_DEG
+from .user_config import uc
+
 GATE_OUTER = 2.7
 GATE_INNER = 1.5
 GATE_DEPTH = 0.26
 BAR_W = (GATE_OUTER - GATE_INNER) / 2.0  # 0.6
+
+# ゲート1を初期カメラ視点の画面中央に置くための定数(env のスポーン/カメラ仕様と一致させる)。
+# カメラ光軸の対地仰角 = CAM_TILT_DEG(ボディから上) + spawn_pitch_deg(前傾=負) ≈ +2.2°(やや上)。
+# スポーン点は gate0 中心より spawn_below_center だけ下(NED D で +)。
+SPAWN_BELOW_CENTER = uc("env_physics", "spawn_below_center", 0.3)
+SPAWN_PITCH_DEG = uc("env_physics", "spawn_pitch_deg", -17.8)
+CAM_AXIS_ELEV_DEG = CAM_TILT_DEG + SPAWN_PITCH_DEG  # 対地仰角(上が正)
 
 
 @dataclass
@@ -108,7 +118,9 @@ class CourseGenerator:
         self.hall = hall or HallSpec()
 
     def generate(self) -> CourseSpec:
-        for attempt in range(64):
+        # 試行上限。最終ゲート(奥行き予算の端)がまれに収まらないseedがあるため多めに取る。
+        # ゲート1を正面固定にした分だけ最終ゲートの余裕が減り、一部seedが64回を超えたため256へ。
+        for attempt in range(256):
             rng = np.random.default_rng(self.seed + attempt * 1000)
             # ブラインド旋回は生成を難しくする。前半40試行のみ強制し、詰まったseedは
             # ブラインドなし(sharp_pのみ)で必ず生成できるようフォールバックする。
@@ -208,6 +220,10 @@ class CourseGenerator:
                 # ヘアピン(ゲート法線が進入/退出の両方から70°超)になり通過不能になる
                 dpsi = float(np.clip(_wrap(psi_target - psi), -p["dpsi_max"], p["dpsi_max"]))
                 psi_new = float(np.clip(psi + dpsi, -psi_lim, psi_lim))
+                if i == 1:
+                    # DCL実機同様、ゲート1は必ずスタートの真正面に置く(最初の区間は旋回なし=直進)。
+                    # start heading=0 と合わせ、gate0 yaw=0・スポーン向き=+N がそのままゲート1を向く。
+                    psi_new = 0.0
 
                 # セグメント長: 前進成分がtarget_dn近くになるように選ぶ
                 cos_p = max(np.cos(psi_new), 0.05)
@@ -222,6 +238,13 @@ class CourseGenerator:
                 if i in climb_idx:
                     # 急上昇/急降下: 天井近く(~7m)まで、または低空へ
                     z = -rng.uniform(5.5, 7.0) if prev[2] > -4.0 else -rng.uniform(1.5, 2.5)
+                elif i == 1:
+                    # ゲート1を初期カメラ視点の画面中央へ: 方位0(直進=横中央)に加え、
+                    # カメラ光軸の仰角ぶんだけ高さを上げて縦中央に合わせる。
+                    # spawn_d(NED D) = gate0中心 + spawn_below_center(下), gate1 D = spawn_d - L*tan(elev)。
+                    spawn_d = prev[2] + SPAWN_BELOW_CENTER
+                    z = spawn_d - L * float(np.tan(np.radians(CAM_AXIS_ELEV_DEG)))
+                    z = float(np.clip(z, -p["z_range"][1], -p["z_range"][0]))
                 else:
                     z = np.clip(prev[2] + rng.uniform(-1.5, 1.5), -p["z_range"][1], -p["z_range"][0])
                 cand[2] = z
@@ -253,7 +276,7 @@ class CourseGenerator:
             h_in = headings[i]
             h_out = headings[i + 1] if i + 1 < len(headings) else headings[i]
             yaw = np.arctan2(np.sin(h_in) + np.sin(h_out), np.cos(h_in) + np.cos(h_out))
-            tilt = 0.0 if i == 0 else p["tilt"]  # スタートゲートは水平
+            tilt = 0.0 if i <= 1 else p["tilt"]  # スタート(0)とゲート1は水平(傾けない)
             gates.append(GateSpec(center_ned=centers[i], yaw=float(yaw),
                                   pitch=float(rng.uniform(-tilt, tilt)),
                                   roll=float(rng.uniform(-tilt, tilt))))

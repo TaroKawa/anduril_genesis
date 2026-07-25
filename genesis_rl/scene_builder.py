@@ -37,6 +37,22 @@ _T_FLIP = np.diag([1.0, -1.0, -1.0])
 # per-envモードの装飾パラメータ(固定サイズ=剛体を再スケールできないため)
 PE_GLOW_COL_H = 6.0   # 床から立てる光柱の固定高[m](ゲート高度差はxy位置のみで吸収)
 
+# スタート固定台(発進パッド): 実機はスタートにゲートが無く、ドローンの固定台だけがある。
+# gate 0 の枠/グロー/ロゴは描かず、スポーン点(高度~1.5m)の直下に床から立てる。
+PAD_TOP_H = 1.4                 # 天板高さ[m](スポーン高度~1.5mのすぐ下)
+PAD_POST = 0.16                 # 支柱の一辺[m]
+PAD_PLATE = 0.5                 # 天板の一辺[m]
+PAD_PLATE_T = 0.06              # 天板厚[m]
+PAD_COLOR = (0.10, 0.10, 0.11)  # 暗い無発光グレー(柱/クラッタと同系)
+
+
+def _start_pad_boxes():
+    """固定台のボックス群 [(中心=床基準の(0,0,z), size)]。両モード共通。"""
+    return [
+        ((0.0, 0.0, PAD_TOP_H / 2.0), (PAD_POST, PAD_POST, PAD_TOP_H)),   # 支柱
+        ((0.0, 0.0, PAD_TOP_H), (PAD_PLATE, PAD_PLATE, PAD_PLATE_T)),     # 天板
+    ]
+
 
 def rot_ned_to_world(R_ned: np.ndarray) -> np.ndarray:
     """NED系の回転行列 → Genesis world系(x軸180°の相似変換)。"""
@@ -72,7 +88,7 @@ class SceneColors:
     glow_rgb: tuple
     ambient: float
     ribbon_fill_gain: float = 0.65   # リボンフィルの発光ゲイン(実機の「青く光る路面」の帯域)
-    ribbon_fill_op: float = 0.4      # 同・不透明度
+    ribbon_fill_op: float = 0.25     # 同・不透明度(実機の青パスは薄く透ける)
 
 
 def sample_colors(rng: np.random.Generator, color_dr: bool) -> SceneColors:
@@ -94,13 +110,13 @@ def sample_colors(rng: np.random.Generator, color_dr: bool) -> SceneColors:
         # 実DCLは明部(V>=120)が画素の10%(リボン路面・天井灯・ゲートのブルーム)。
         # フィルは明るく(実測リボン帯 mean RGB(32,112,143)、max飽和)
         fill_gain = float(rng.uniform(0.85, 1.15))
-        fill_op = float(rng.uniform(0.35, 0.56))
+        fill_op = float(rng.uniform(0.18, 0.32))   # 実機の青パスは薄く透ける
     else:
         gate = (1.0, 0.24, 0.22)      # 実機のネオン赤(彩度高)。白ロゴ/ハロが白飛び側を担う
         ribbon = (0.1, 0.85, 1.0)
         glow = (1.0, 0.8, 0.15)
         ambient = 0.03
-        fill_gain, fill_op = 0.97, 0.47
+        fill_gain, fill_op = 0.97, 0.26
     return SceneColors(gate_rgb=gate, ribbon_rgb=ribbon, glow_rgb=glow, ambient=ambient,
                        ribbon_fill_gain=fill_gain, ribbon_fill_op=fill_op)
 
@@ -121,6 +137,7 @@ class SceneBuilder:
         self.drone_entity = None
         self.static_entities = []
         self.gate_bar_entities = []   # per_env時: (entity, gi, off_side, off_up) のリスト
+        self.start_pad_entities = []  # スタート固定台(gate 0 差し替え)。per_env時はenv毎に配置
 
     def build_scene(self, scene, drone_cfg):
         import genesis as gs
@@ -273,77 +290,85 @@ class SceneBuilder:
                                      size=(GATE_DEPTH, size_side, size_up),
                                      fixed=True, collision=collision)
 
-            half = (GATE_INNER + BAR_W) / 2  # バー中心オフセット 1.05m
-            emis = c.gate_rgb
-            # 左右バー(縦 2.7m)+ 上下バー(横 1.5m)
-            self._static(scene, gs, place(+half, 0.0, BAR_W, GATE_OUTER), None, emissive=emis)
-            self._static(scene, gs, place(-half, 0.0, BAR_W, GATE_OUTER), None, emissive=emis)
-            self._static(scene, gs, place(0.0, +half, GATE_INNER, BAR_W), None, emissive=emis)
-            self._static(scene, gs, place(0.0, -half, GATE_INNER, BAR_W), None, emissive=emis)
+            if gi == 0:
+                # 実機はスタートにゲート枠が無く、ドローンの固定台のみ。gate 0 は枠/装飾を
+                # 描かず、スポーン点(高度~1.5m)の直下に床から固定台を立てる(衝突なし)。
+                for (off, size) in _start_pad_boxes():
+                    self._static(scene, gs, gs.morphs.Box(
+                        pos=(cw[0] + off[0], cw[1] + off[1], off[2]),
+                        size=size, fixed=True, collision=False), PAD_COLOR)
+            else:
+                half = (GATE_INNER + BAR_W) / 2  # バー中心オフセット 1.05m
+                emis = c.gate_rgb
+                # 左右バー(縦 2.7m)+ 上下バー(横 1.5m)
+                self._static(scene, gs, place(+half, 0.0, BAR_W, GATE_OUTER), None, emissive=emis)
+                self._static(scene, gs, place(-half, 0.0, BAR_W, GATE_OUTER), None, emissive=emis)
+                self._static(scene, gs, place(0.0, +half, GATE_INNER, BAR_W), None, emissive=emis)
+                self._static(scene, gs, place(0.0, -half, GATE_INNER, BAR_W), None, emissive=emis)
 
-            # 発光ハロー(疑似ブルーム): 実映像のゲートは強いブルームで枠の周囲が滲む。
-            # ラスタライザにブルームは無いので、枠より一回り大きい半透明発光ボックスで近似
-            if self.rng.random() < 0.9:
-                op = float(self.rng.uniform(0.08, 0.18))
-                halo_col = tuple(min(1.0, v * 0.95) for v in emis)
-                for off_s, off_u, ss, su in [(+half, 0.0, BAR_W * 2.0, GATE_OUTER + 0.15),
-                                             (-half, 0.0, BAR_W * 2.0, GATE_OUTER + 0.15),
-                                             (0.0, +half, GATE_INNER + 0.15, BAR_W * 2.0),
-                                             (0.0, -half, GATE_INNER + 0.15, BAR_W * 2.0)]:
-                    pos = cw + R_w @ np.array([0.0, off_s, off_u])
+                # 発光ハロー(疑似ブルーム): 実映像のゲートは強いブルームで枠の周囲が滲む。
+                # ラスタライザにブルームは無いので、枠より一回り大きい半透明発光ボックスで近似
+                if self.rng.random() < 0.9:
+                    op = float(self.rng.uniform(0.08, 0.18))
+                    halo_col = tuple(min(1.0, v * 0.95) for v in emis)
+                    for off_s, off_u, ss, su in [(+half, 0.0, BAR_W * 2.0, GATE_OUTER + 0.15),
+                                                 (-half, 0.0, BAR_W * 2.0, GATE_OUTER + 0.15),
+                                                 (0.0, +half, GATE_INNER + 0.15, BAR_W * 2.0),
+                                                 (0.0, -half, GATE_INNER + 0.15, BAR_W * 2.0)]:
+                        pos = cw + R_w @ np.array([0.0, off_s, off_u])
+                        m = gs.morphs.Box(pos=tuple(pos), quat=quat,
+                                          size=(GATE_DEPTH * 0.4, ss, su),
+                                          fixed=True, collision=False)
+                        ent = scene.add_entity(m, surface=gs.surfaces.Rough(
+                            color=tuple(v * 0.2 for v in halo_col), emissive=halo_col, opacity=op))
+                        self.static_entities.append(ent)
+
+                # 白ロゴバンド("AI-GP"風): 上バーの中央に白発光の横帯(実ゲートのロゴ輝度を近似)
+                if self.rng.random() < 0.9:
+                    lw = float(self.rng.uniform(0.7, 1.2))
+                    pos = cw + R_w @ np.array([0.0, 0.0, half])
                     m = gs.morphs.Box(pos=tuple(pos), quat=quat,
-                                      size=(GATE_DEPTH * 0.4, ss, su),
+                                      size=(GATE_DEPTH + 0.02, lw, 0.16),
                                       fixed=True, collision=False)
-                    ent = scene.add_entity(m, surface=gs.surfaces.Rough(
-                        color=tuple(v * 0.2 for v in halo_col), emissive=halo_col, opacity=op))
-                    self.static_entities.append(ent)
+                    self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
 
-            # 白ロゴバンド("AI-GP"風): 上バーの中央に白発光の横帯(実ゲートのロゴ輝度を近似)
-            if self.rng.random() < 0.9:
-                lw = float(self.rng.uniform(0.7, 1.2))
-                pos = cw + R_w @ np.array([0.0, 0.0, half])
-                m = gs.morphs.Box(pos=tuple(pos), quat=quat,
-                                  size=(GATE_DEPTH + 0.02, lw, 0.16),
-                                  fixed=True, collision=False)
-                self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
+                # 白ロゴ/市松風マーキング(バー面上の小さな白発光パッチ、YOLOX偽検出源の再現)
+                n_marks = int(self.rng.integers(2, 5))
+                for _ in range(n_marks):
+                    side = float(self.rng.uniform(-1.2, 1.2))
+                    up = float(self.rng.choice([-half, half])) if abs(side) < GATE_INNER / 2 \
+                        else float(self.rng.uniform(-1.2, 1.2))
+                    w = float(self.rng.uniform(0.15, 0.5))
+                    pos = cw + R_w @ np.array([0.0, side, up])
+                    m = gs.morphs.Box(pos=tuple(pos), quat=quat,
+                                      size=(GATE_DEPTH + 0.02, w, 0.18),
+                                      fixed=True, collision=False)
+                    self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
 
-            # 白ロゴ/市松風マーキング(バー面上の小さな白発光パッチ、YOLOX偽検出源の再現)
-            n_marks = int(self.rng.integers(2, 5))
-            for _ in range(n_marks):
-                side = float(self.rng.uniform(-1.2, 1.2))
-                up = float(self.rng.choice([-half, half])) if abs(side) < GATE_INNER / 2 \
-                    else float(self.rng.uniform(-1.2, 1.2))
-                w = float(self.rng.uniform(0.15, 0.5))
-                pos = cw + R_w @ np.array([0.0, side, up])
-                m = gs.morphs.Box(pos=tuple(pos), quat=quat,
-                                  size=(GATE_DEPTH + 0.02, w, 0.18),
-                                  fixed=True, collision=False)
-                self._static(scene, gs, m, None, emissive=(0.95, 0.95, 0.95))
-
-            # ゲート脇のポール+発光球(実映像の信号灯: 緑ランプ / ピンクのグロー球)
-            for sgn in (+1.0, -1.0):
-                if self.rng.random() < 0.75:
-                    dist = float(self.rng.uniform(2.6, 4.5))
-                    base = cw + R_w @ np.array([0.0, sgn * dist, 0.0])
-                    ph = float(self.rng.uniform(1.6, 2.6))
-                    self._static(scene, gs,
-                                 gs.morphs.Box(pos=(float(base[0]), float(base[1]), ph / 2),
-                                               size=(0.07, 0.07, ph), fixed=True, collision=False),
-                                 (0.04, 0.04, 0.045))
-                    orb = [(1.0, 0.55, 0.62), (0.45, 1.0, 0.5)][int(self.rng.integers(0, 2))]
-                    r_orb = float(self.rng.uniform(0.10, 0.18))
-                    ent = scene.add_entity(
-                        gs.morphs.Sphere(pos=(float(base[0]), float(base[1]), ph + r_orb), radius=r_orb,
-                                         fixed=True, collision=False),
-                        surface=gs.surfaces.Emission(color=orb))
-                    self.static_entities.append(ent)
-                    # 球のハロー(半透明の大きい球)
-                    ent = scene.add_entity(
-                        gs.morphs.Sphere(pos=(float(base[0]), float(base[1]), ph + r_orb),
-                                         radius=r_orb * 2.4, fixed=True, collision=False),
-                        surface=gs.surfaces.Rough(color=tuple(v * 0.2 for v in orb),
-                                                  emissive=orb, opacity=0.25))
-                    self.static_entities.append(ent)
+                # ゲート脇のポール+発光球(実映像の信号灯: 緑ランプ / ピンクのグロー球)
+                for sgn in (+1.0, -1.0):
+                    if self.rng.random() < 0.75:
+                        dist = float(self.rng.uniform(2.6, 4.5))
+                        base = cw + R_w @ np.array([0.0, sgn * dist, 0.0])
+                        ph = float(self.rng.uniform(1.6, 2.6))
+                        self._static(scene, gs,
+                                     gs.morphs.Box(pos=(float(base[0]), float(base[1]), ph / 2),
+                                                   size=(0.07, 0.07, ph), fixed=True, collision=False),
+                                     (0.04, 0.04, 0.045))
+                        orb = [(1.0, 0.55, 0.62), (0.45, 1.0, 0.5)][int(self.rng.integers(0, 2))]
+                        r_orb = float(self.rng.uniform(0.10, 0.18))
+                        ent = scene.add_entity(
+                            gs.morphs.Sphere(pos=(float(base[0]), float(base[1]), ph + r_orb), radius=r_orb,
+                                             fixed=True, collision=False),
+                            surface=gs.surfaces.Emission(color=orb))
+                        self.static_entities.append(ent)
+                        # 球のハロー(半透明の大きい球)
+                        ent = scene.add_entity(
+                            gs.morphs.Sphere(pos=(float(base[0]), float(base[1]), ph + r_orb),
+                                             radius=r_orb * 2.4, fixed=True, collision=False),
+                            surface=gs.surfaces.Rough(color=tuple(v * 0.2 for v in orb),
+                                                      emissive=orb, opacity=0.25))
+                        self.static_entities.append(ent)
 
             # ゲート直前の床の黄色グロー(実映像のゲート手前の黄色い帯)。ゲートの向き
             # (法線の水平成分)に沿ってレーン状に伸ばし、収束する青ラインの終端＝ゲート
@@ -357,17 +382,8 @@ class SceneBuilder:
                 surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
             )
             self.glow_entities.append(glow)
-            # 床→ゲート下端への光柱(実映像のアクティブゲート直下に立つ黄色い光の柱)。
-            # glowと同じ per-env 表示制御(genesis_race_env._update_glow が同期移動)
-            hcol = max(float(cw[2]) - 1.2, 0.5)
-            col_ent = scene.add_entity(
-                gs.morphs.Box(pos=(cw[0], cw[1], hcol / 2), euler=(0.0, 0.0, ang),
-                              size=(0.5, 0.5, hcol), fixed=False, collision=False),
-                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                surface=gs.surfaces.Rough(color=tuple(v * 0.2 for v in c.glow_rgb),
-                                          emissive=tuple(c.glow_rgb), opacity=0.4),
-            )
-            self.glow_col_entities.append(col_ent)
+            # 光柱は廃止(実機はゲート手前の床だけが光り、垂直の光柱は立たない)。
+            # glow_col_entities は空のまま(_update_glow/_place_glow_per_env は len で保護)。
 
     # ゲート4バーの面内オフセット(side,up)とサイズ(side,up)。全ゲート共通。
     GATE_BARS = None  # 遅延初期化(モジュール定数から)
@@ -418,6 +434,7 @@ class SceneBuilder:
         c = self.colors
         self.glow_entities = []
         self.glow_col_entities = []
+        self.start_pad_entities = []
         half = (GATE_INNER + BAR_W) / 2  # 1.05m
         bars = [
             (+half, 0.0, BAR_W, GATE_OUTER),
@@ -444,26 +461,30 @@ class SceneBuilder:
         halo_surf = gs.surfaces.Rough(color=tuple(v * 0.2 for v in halo_col),
                                       emissive=halo_col, opacity=0.14)
         white_surf = gs.surfaces.Emission(color=(0.95, 0.95, 0.95))
+        # スタート固定台(gate 0 差し替え): 床基準ローカル座標の統合メッシュ1個。
+        # glow同様 非固定+gravity_compensation で作り、_place_glow_per_env が各envの
+        # gate 0 位置(x,y,床)へ移動する。
+        pad_f = self._mesh_file(self._combine_mesh(
+            boxes=[(ct, sz, None) for (ct, sz) in _start_pad_boxes()]))
+        pad_surf = gs.surfaces.Rough(color=PAD_COLOR)
         for gi, gate in enumerate(self.course.gates):
             cw = np.array(ned2w(gate.center_ned))
-            # 3メッシュはゲートローカル座標。off=(0,0,0)で登録し、_place_gates_per_env が
-            # ゲート中心へ set_pos・ゲート向き(R_w)へ set_quat する(バーと同じ配置経路)。
-            for fpath, surf in ((frame_f, frame_surf), (halo_f, halo_surf), (white_f, white_surf)):
-                ent = self._mesh_ent(scene, gs, fpath, surf)
-                self.gate_bar_entities.append((ent, gi, (0.0, 0.0, 0.0)))
-            # 床グロー+光柱(非固定box)。build時はcourse[0]配置、_place_glow_per_envがenv毎に移動。
+            if gi == 0:
+                # 実機はスタートにゲート枠が無い。gate 0 の表示メッシュは積まず固定台のみ。
+                self.start_pad_entities.append(self._mesh_ent(scene, gs, pad_f, pad_surf))
+            else:
+                # 3メッシュはゲートローカル座標。off=(0,0,0)で登録し、_place_gates_per_env が
+                # ゲート中心へ set_pos・ゲート向き(R_w)へ set_quat する(バーと同じ配置経路)。
+                for fpath, surf in ((frame_f, frame_surf), (halo_f, halo_surf), (white_f, white_surf)):
+                    ent = self._mesh_ent(scene, gs, fpath, surf)
+                    self.gate_bar_entities.append((ent, gi, (0.0, 0.0, 0.0)))
+            # 床グロー(非固定box)。build時はcourse[0]配置、_place_glow_per_envがenv毎に移動。
+            # 光柱は廃止(実機はゲート手前の床だけが光る)。glow_col_entities は空のまま。
             self.glow_entities.append(scene.add_entity(
                 gs.morphs.Box(pos=(cw[0], cw[1], 0.02), size=(4.0, 0.7, 0.02),
                               fixed=False, collision=False),
                 material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
                 surface=gs.surfaces.Emission(color=tuple(c.glow_rgb)),
-            ))
-            self.glow_col_entities.append(scene.add_entity(
-                gs.morphs.Box(pos=(cw[0], cw[1], PE_GLOW_COL_H / 2),
-                              size=(0.5, 0.5, PE_GLOW_COL_H), fixed=False, collision=False),
-                material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-                surface=gs.surfaces.Rough(color=tuple(v * 0.2 for v in c.glow_rgb),
-                                          emissive=tuple(c.glow_rgb), opacity=0.4),
             ))
 
     def _add_ribbon(self, scene, gs):
@@ -506,9 +527,9 @@ class SceneBuilder:
             fill = _mesh_entity(fv, ff, gs.surfaces.Rough(
                 color=(wr * 0.15, wg * 0.15, wb * 0.15),
                 emissive=(wr * fg, wg * fg, wb * fg), opacity=fo))
-            # レール: 細く明るい縁
+            # レール: 細く明るい縁(パスを透けさせるため縁もやや透明に)
             rail = _mesh_entity(rv, rf, gs.surfaces.Rough(
-                color=(r * 0.2, g * 0.2, b * 0.2), emissive=(r, g, b), opacity=0.95))
+                color=(r * 0.2, g * 0.2, b * 0.2), emissive=(r, g, b), opacity=0.7))
             self.ribbon_entities.append(fill)
             self.ribbon_rail_entities.append(rail)
 

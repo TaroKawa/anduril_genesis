@@ -341,6 +341,16 @@ class GenesisRaceEnv:
                 cols[k].set_quat(quat[:, k], envs_idx=self._env_ar,
                                  zero_velocity=True, relative=False)
 
+        # スタート固定台(gate 0 差し替え)を各envの gate 0(x,y,床)へ移動。
+        # meshは床基準ローカル座標なので原点を(x,y,0)に置くだけ。向きはyaw不問=identity。
+        pads = getattr(self.builder, "start_pad_entities", [])
+        if pads and G > 0:
+            pad_pos_c = np.stack([np.array([spec_gate[c][0][0][0], spec_gate[c][0][0][1], 0.0],
+                                           dtype=np.float32) for c in range(K)])   # (K,3)
+            pad_pos = torch.tensor(pad_pos_c[env2c], device=dev)                    # (N,3)
+            pads[0].set_pos(pad_pos, envs_idx=self._env_ar,
+                            zero_velocity=True, relative=False)
+
     def _place_world_pools_per_env(self):
         """柱/クラッタ/ポール/オーブ/リボンダッシュのプールを各envのコース配置へ置く。
 
