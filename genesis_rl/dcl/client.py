@@ -35,9 +35,9 @@ ENCAPSULATED_RACE_STATUS_MSG_ID = 1
 ENCAPSULATED_TRACK_INFO_MSG_ID = 2   # ゲート位置/向き/寸法(VQ1で有効、VQ2では null化)
 # ↓デプロイ調整値は config.yaml: deploy が単一ソース(下は無ければの既定値)。
 COLLISION_ACCEL_MPS2 = uc("deploy", "collision_accel_mps2", 40.0)  # |accel|>これで衝突検知
-# 実YOLOX/HSVのbbox面積は幾何投影より小さく(同距離で約1/5、runs/sysid_bit16_0723)、
-# デプロイ側 rel_dist を学習側に合わせるため実検出器の GATE_AREA_MAX 既定を下げる(--gate-area-maxで上書き可)。
-REAL_GATE_AREA_MAX = uc("deploy", "real_gate_area_max", 25000.0)
+# rel_dist正規化の分母。YOLOX-x の実bbox面積は既知距離レンダの実測で幾何投影 s_px² の
+# 1.10倍(2026-07-26)なので、学習契約と同じ150000が正しい(旧25000は6倍過小だった)。
+REAL_GATE_AREA_MAX = uc("deploy", "real_gate_area_max", 150000.0)
 # 生HIGHRES_IMU gyro は学習の観測規約に対し符号反転。ここで規約へ揃える(生値のままだと正帰還)。
 GYRO_OBS_SIGN = uc("deploy", "gyro_obs_sign", (-1.0, -1.0, -1.0))
 ACCEL_OBS_SIGN = uc("deploy", "accel_obs_sign", (1.0, 1.0, 1.0))   # accelは整合
@@ -594,7 +594,7 @@ class GenesisPilot:
               f"deploy{tuple(np.round(deploy_gain, 2))} = "
               f"{tuple(np.round(self.rate_scale, 3))} "
               f"(rad/s bit {'ON' if USE_RAD_PER_SEC_BODY_RATES else 'OFF'})", flush=True)
-        self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)
+        self.last_action = np.zeros(C.ACTION_DIM, dtype=np.float32)   # 観測に載せる a_{t-1}
         self.last_vec = np.zeros(C.VEC_DIM, dtype=np.float32)   # 記録用: 直近に方策へ渡したvec
         self._reset_flag = torch.zeros(1, dtype=torch.bool, device=self.device)
         # CUDA初期化を離陸前に済ませる(初回推論の~100msスパイク回避)
@@ -613,18 +613,27 @@ class GenesisPilot:
         imu = shared.get("imu") or {}
         gyro = np.asarray(imu.get("gyro", (0.0, 0.0, 0.0)), np.float32) * np.asarray(GYRO_OBS_SIGN, np.float32)
         accel = np.asarray(imu.get("accel", (0.0, 0.0, -9.81)), np.float32) * np.asarray(ACCEL_OBS_SIGN, np.float32)
-        vec[C.VEC_GYRO] = gyro / C.RATE_SCALE
-        vec[C.VEC_ACCEL] = accel / C.ACCEL_SCALE
+        # 学習側は内部ω(|ω|≤rate_max=4rad/s)とスパイク付き比力しか出さず、観測の実測レンジは
+        # gyro/RATE_SCALE が±0.9以内・accel/ACCEL_SCALE が±1以内(runs/obs_audit_genesis)。
+        # 実シムは衝突後のスピンで gyro が最大62rad/s(正規化15)まで出て完全に分布外になるため、
+        # 学習で見た範囲へクリップしてから渡す(方向情報は保つ)。
+        vec[C.VEC_GYRO] = np.clip(gyro / C.RATE_SCALE, -1.0, 1.0)
+        vec[C.VEC_ACCEL] = np.clip(accel / C.ACCEL_SCALE, -2.5, 2.5)
         og = shared.get("obs_gate") or {}
+        # age は「最後に検出できてからの経過」ではなく「いま渡すフレームの鮮度」。VideoRXは
+        # 検出の成否によらず処理フレームごとに obs_gate を publish するので age_s は常にフレーム齢。
+        # 学習側 _build_obs も det_queue の遅延段数(1-2フレーム=0.067-0.133)を可視・不可視に
+        # かかわらず入れる契約なので、不可視時に 1.0 を入れてはいけない
+        # (実飛行ログは不可視時 age_n=1.000、学習は0.067。毎ステップ分布外だった)。
         age_s = now - float(og.get("t_wall", 0.0))
+        age_n = float(np.clip(age_s / C.GATE_OBS_MAX_AGE_S, 0.0, 1.0))
         visible = bool(og.get("visible", 0)) and age_s <= C.GATE_OBS_MAX_AGE_S
         if visible:
             px, py = og.get("center", (0.5, 0.5))
             vec[C.VEC_GATE] = (np.clip(px * 2 - 1, -1.5, 1.5), np.clip(py * 2 - 1, -1.5, 1.5),
-                               1.0, np.clip(og.get("rel_dist", 1.0), 0.0, 1.0),
-                               np.clip(age_s / C.GATE_OBS_MAX_AGE_S, 0.0, 1.0))
+                               1.0, np.clip(og.get("rel_dist", 1.0), 0.0, 1.0), age_n)
         else:
-            vec[C.VEC_GATE] = (0.0, 0.0, 0.0, 1.0, 1.0)
+            vec[C.VEC_GATE] = (0.0, 0.0, 0.0, 1.0, age_n)
         # one-hot = 通過済みゲート数(Genesis規約: onehot[active_gate-1]、スポーン時
         # active_gate=1 → onehot[0])。DCLのactive_gate_indexは0始まりで「通過済み本数」
         # (スポーン=0、最初のゲート通過で1)なので、そのままがGenesisのonehot indexに一致する:
@@ -635,6 +644,8 @@ class GenesisPilot:
         agi = int((shared.get("race") or {}).get("active_gate_index", 0))
         passed = min(max(agi, 0), C.MAX_GATES - 1)
         vec[C.VEC_ONEHOT.start + passed] = 1.0
+        # 直前に出したアクション a_{t-1}。学習側 _build_obs も引数 actions(=その決定で出した
+        # アクション)を観測へ載せるので一致する(env側のoff-by-oneは2026-07-26に修正済み)。
         vec[C.VEC_LAST_ACTION] = self.last_action
         return vec
 

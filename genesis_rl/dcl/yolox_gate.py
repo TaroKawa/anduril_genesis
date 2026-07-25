@@ -385,12 +385,13 @@ class GateYOLOX:
 
         # andu_ddrnet 準拠の後処理: 元画像座標へ戻し min_area/max_side でフィルタ →
         # 面積最大の1個だけ採用 → ボックス内オレンジ率で本物のゲートか検証。
-        # 追加(deploy実測に基づく): 画面端3辺以上に達する「視野を覆う巨大box」は選択前に
-        # 除外する。ゲート通過直後はこの種のbox(score~0.5-0.65, 面積~23万px²)が出続け、
-        # 面積最大選択が本物の次ゲート(score0.9台)より優先してしまい、agi=1区間の可視率が
-        # 20%まで落ちていた(runs/dcl_onehot_fix)。除外すれば次ゲートが正しく選ばれる。
+        # raw(クリップ前)座標も保持する: 至近でゲート枠が画面外へはみ出すと、クリップ後の
+        # bbox中心は画面中心へ引き寄せられ「整列済み」という偽信号になる。学習側
+        # SimGateDetector は投影中心が画面内(10pxマージン)なら可視・その中心を返す契約なので、
+        # 中心と面積は raw から取り、可視判定も「raw中心が画面内か」で行う(§可視判定を参照)。
         d = dets.cpu().numpy()
-        boxes = d[:, :4] / r
+        raw = d[:, :4] / r
+        boxes = raw.copy()
         boxes[:, 0::2] = boxes[:, 0::2].clip(0, W)
         boxes[:, 1::2] = boxes[:, 1::2].clip(0, H)
         bw = boxes[:, 2] - boxes[:, 0]
@@ -400,9 +401,13 @@ class GateYOLOX:
             keep &= (bw * bh) >= self.min_area
         if self.max_side > 0:
             keep &= np.maximum(bw, bh) <= self.max_side
-        n_edges = ((boxes[:, 0] <= 2).astype(int) + (boxes[:, 1] <= 2).astype(int)
-                   + (boxes[:, 2] >= W - 2).astype(int) + (boxes[:, 3] >= H - 2).astype(int))
-        keep &= ~((n_edges >= 3) | ((bw > 0.9 * W) & (bh > 0.9 * H)))
+        # 可視判定(学習契約と同一): rawのbbox中心が画面内(10pxマージン)にあること。
+        # ゲート通過直後に出る「視野を覆う巨大box」は、機体がゲート面の内側/外側にいて
+        # 中心が画面外へ抜けるため自動的に落ちる(旧・端3辺ルールの置き換え。あちらは
+        # 正対至近=本来可視のケースまで捨てていた)。
+        raw_cx = (raw[:, 0] + raw[:, 2]) * 0.5
+        raw_cy = (raw[:, 1] + raw[:, 3]) * 0.5
+        keep &= (raw_cx > 10) & (raw_cx < W - 10) & (raw_cy > 10) & (raw_cy < H - 10)
         if not keep.any():
             res = {"visible": 0, "center": (0.5, 0.5), "rel_dist": 1.0}
             if return_box:
@@ -426,11 +431,14 @@ class GateYOLOX:
                 res["score"] = float(best[4] * best[5])
                 res["orange"] = float(orange)
             return res
-        # 至近の「視野を覆うbox」(3辺接触/画面9割超)は上のkeepフィルタで既に候補から
-        # 除外済み(bbox中心=(0.5,0.5)という偽の整列信号を防ぐ。学習側契約では投影中心が
-        # 画面外に出た時点で不可視。runs/dcl_fable_0724b の激突事象の対策)。
-        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        rel = float(np.clip(1.0 - area_box / self.gate_area_max, 0.0, 1.0))
+        # 中心と面積は raw(クリップ前)から取る。学習側 SimGateDetector は
+        #   center = ゲート中心の投影 / rel_dist = 1 - s_px²/GATE_AREA_MAX, s_px = FX·2.7/d
+        # で、どちらも画面外へはみ出しても幾何どおりに増え続ける(s_pxのみIMG_Wでクランプ)。
+        # クリップ後の値を使うと至近でrel_distが頭打ちになり中心も画面中心へ寄る。
+        rx1, ry1, rx2, ry2 = (float(v) for v in raw[i])
+        cx, cy = (rx1 + rx2) * 0.5, (ry1 + ry2) * 0.5
+        area_raw = max(rx2 - rx1, 0.0) * max(ry2 - ry1, 0.0)
+        rel = float(np.clip(1.0 - area_raw / self.gate_area_max, 0.0, 1.0))
         res = {"visible": 1, "center": (float(cx / W), float(cy / H)), "rel_dist": rel}
         if return_box:
             res["box"] = (x1, y1, x2, y2)

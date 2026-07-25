@@ -26,15 +26,23 @@ class HwConfig:
 @dataclass
 class RenderConfig:
     backend: str = "auto"         # "batch" | "sequential" | "none" | "auto"
-    width: int = 320              # 学習時レンダ解像度(本番intrinsicsの1/2、FoV同一)
-    height: int = 180
+    # レンダ解像度は本番と同一(640x360, fx=fy=320)。1/2解像度(320x180)だと224への
+    # 「拡大」になり、実機の640→224「縮小」と鮮鋭度・エイリアスが別物になってエンコーダから
+    # 見て別ドメインになる(2026-07-26)。契約 IMG_W/IMG_H と一致させること。
+    width: int = 640
+    height: int = 360
+    # 遅延キュー・方策へ渡す観測画像の解像度。デプロイ(client.py)は
+    # cv2.resize(frame,(224,224)) の全面リサイズで224へ落とすので学習も同じ形にする。
+    # レンダ直後にここへ落とすことで img_queue のVRAM(640x360の1/4.6)も抑えられる。
+    obs_res: int = 224
     jpeg_dr: bool = False         # JPEG劣化DR(逐次モードのみ推奨)
     max_seq_envs: int = 16        # sequentialバックエンドの実レンダenv数上限(per collector)
     # 露出ゲイン(レンダ直後に乗算・飽和)。ラスタライザは発光面でも指定色よりずっと暗く
     # 描画し(Emission(1,1,1)でも~141、ゲート赤は~102)、実DCL映像の白飛びするネオン
     # (シアンレール max(252,255,255)・ゲート max(255,180,183))に届かない。
-    # 2.6で発光面の芯が飽和し実機の輝度レンジに一致する(実測較正 2026-07-25)。
-    exposure: float = 2.6
+    # 2.6だと発光の芯は飽和するが画面全体が持ち上がりすぎる(飛行視点で明部22% vs 実機10%)。
+    # 1.8で明部・平均とも実DCLの輝度分布に最接近(実測較正 2026-07-26)。
+    exposure: float = 1.8
     # 測光ドメインランダム化の強さ(0=無効)。per-envのゲイン/ガンマ/コントラスト/ノイズを
     # エピソードごとに再サンプルしてレンダフレームへ適用する。レンダ実装(Madrona/EGLラスタ/
     # ホストGL/実シムDCL)間の色応答・露出差に対する方策の視覚頑健化が目的(sim2sim転移で必須。
@@ -83,9 +91,11 @@ class SensorConfig:
     det_dropout_base: float = uc("sensor", "det_dropout_base", 0.02)
     det_dropout_close: float = uc("sensor", "det_dropout_close", 0.10)  # 至近ドロップアウト増分
     det_outlier_p: float = uc("sensor", "det_outlier_p", 0.01)     # 偽検出
-    det_delay_frames: int = uc("sensor", "det_delay_frames", 1)    # 17.3ms検出遅延→1フレーム
+    det_bbox_gain: float = uc("sensor", "det_bbox_gain", 1.10)     # 実bbox面積/幾何投影(実測)
+    det_min_area: float = uc("sensor", "det_min_area", 500.0)      # deploy YOLOXのmin_area[px²]
+    det_delay_frames: int = uc("sensor", "det_delay_frames", 2)    # 実機85ms相当(2-3フレーム)
     det_delay_jitter: int = uc("sensor", "det_delay_jitter", 1)
-    img_delay_frames: int = uc("sensor", "img_delay_frames", 1)    # JPEG+UDP相当
+    img_delay_frames: int = uc("sensor", "img_delay_frames", 2)    # JPEG+UDP+処理(実測85ms)
     img_delay_jitter: int = uc("sensor", "img_delay_jitter", 1)
     act_delay_steps: int = uc("sensor", "act_delay_steps", 0)      # アクション遅延(物理ステップ)
     act_delay_jitter: int = uc("sensor", "act_delay_jitter", 1)

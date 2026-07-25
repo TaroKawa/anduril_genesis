@@ -103,12 +103,13 @@ class GenesisRaceEnv:
         # ため使わない。天井スラブは非表示(衝突のみ)にして平行光を屋内に届かせる
         # (実映像の天井も「黒地に発光ストリップ」なので見た目は一致する)。
         # 実飛行フレームの実測(黒地に発光要素のみ、暗部42%・明部10%)に合わせ平行光は弱く。
-        # 非発光面はより黒く沈め(実機の中間灰は少ない)、明るさは発光面(リボン/灯/ゲート)が担う。
+        # 実測: 実DCLは中間調(V 25-120)が画素の48%(柱/トラス/機体が薄灰で見える)。
+        # 露出2.6込みで柱・機体の中間灰が出る強度に較正(強すぎると床が灰色に浮く)。
         lights = [
             {"type": "directional", "dir": (-0.3, -0.4, -1.0), "color": (1.0, 1.0, 1.0),
-             "intensity": float(rng.uniform(0.15, 0.45))},
+             "intensity": float(rng.uniform(0.35, 0.7))},
             {"type": "directional", "dir": (0.5, 0.3, -1.0), "color": (0.9, 0.9, 1.0),
-             "intensity": float(rng.uniform(0.07, 0.25))},
+             "intensity": float(rng.uniform(0.15, 0.4))},
         ]
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=C.DT_PHYS, substeps=1),
@@ -147,7 +148,11 @@ class GenesisRaceEnv:
         s = cfg.sensors
         self.det_queue = DelayQueue(self.num_envs, (4,), max_delay=s.det_delay_frames + s.det_delay_jitter + 1,
                                     device=self.device)
-        self.img_queue = DelayQueue(self.num_envs, (cfg.render.height, cfg.render.width, 3),
+        # 観測画像はレンダ解像度(=本番と同じ640x360)から obs_res へ全面リサイズしてから
+        # キューへ積む。deploy(client.py)の cv2.resize(frame,(224,224)) と同じ形にするためで、
+        # 副次的に遅延キューのVRAMも 640x360 の 1/4.6 で済む。
+        self.obs_res = int(getattr(cfg.render, "obs_res", 224))
+        self.img_queue = DelayQueue(self.num_envs, (self.obs_res, self.obs_res, 3),
                                     max_delay=s.img_delay_frames + s.img_delay_jitter,
                                     device=self.device, dtype=torch.uint8)
 
@@ -160,7 +165,9 @@ class GenesisRaceEnv:
         self.prev_x_rel = z(N)
         self.episode_steps = z(N, dtype=torch.long)       # 物理ステップ
         self.steps_since_gate = z(N, dtype=torch.long)
-        self.last_action = z(N, C.ACTION_DIM)
+        self.last_action = z(N, C.ACTION_DIM)      # a_{t-1}
+        self.last_action2 = z(N, C.ACTION_DIM)     # a_{t-2}(振動=符号反転の検出用)
+        self.prev_omega = z(N, 3)                  # 前決定の角速度 [rad/s](角加速度ペナルティ用)
         self.prev_cmd = z(N, C.ACTION_DIM)
         self.act_delay = z(N, dtype=torch.long)
         self.d_prev = z(N)
@@ -226,6 +233,18 @@ class GenesisRaceEnv:
         self.total_arc = torch.tensor(
             np.array([max(specs[c].total_arc, 1e-6) for c in env2course], dtype=np.float32),
             device=dev)                                                            # (N,)
+
+        # 柱の水平位置(N,P,2)。実機のYOLOXは柱の裏のゲートを検出できないので、検出器の
+        # 遮蔽判定に使う。コース毎に本数が違うのでPmaxへゼロ埋め+validマスクで持つ。
+        pil = [np.asarray(sp.pillars, np.float32).reshape(-1, 2) for sp in specs]
+        pmax = max((len(p) for p in pil), default=0)
+        pxy = np.zeros((len(specs), max(pmax, 1), 2), np.float32)
+        pvalid = np.zeros((len(specs), max(pmax, 1)), bool)
+        for j, p in enumerate(pil):
+            pxy[j, :len(p)] = p
+            pvalid[j, :len(p)] = True
+        self.pillar_xy = torch.tensor(pxy[env2course], device=dev)                 # (N,P,2) NED
+        self.pillar_valid = torch.tensor(pvalid[env2course], device=dev)           # (N,P)
 
         # 青パス(ribbon)を粗くダウンサンプルして per-env 保持(進路追従シェイピング用)。
         # 全コースは同一ゲート数=同一サンプル数なので固定長でstackできる。
@@ -443,6 +462,8 @@ class GenesisRaceEnv:
         self.episode_steps[envs_idx] = 0
         self.steps_since_gate[envs_idx] = 0
         self.last_action[envs_idx] = 0.0
+        self.last_action2[envs_idx] = 0.0
+        self.prev_omega[envs_idx] = 0.0
         self.prev_cmd[envs_idx] = 0.0
         self.collision[envs_idx] = False
         gp = self.gate_pos[envs_idx, active]
@@ -485,14 +506,18 @@ class GenesisRaceEnv:
         # 青パスの点滅(全env共通の明滅、区間ごとに位相ずれ)
         self._tick_blink()
         # --- フレーム境界(30Hz): レンダ + 検出 ---
-        rgb = self.rig.render()
+        rgb = self._to_obs_res(self.rig.render())
         if float(getattr(cfg.render, "photo_dr", 0.0)) > 0.0:
             rgb = self._apply_photo_dr(rgb)
         self.img_queue.push(rgb)
         act_idx = self.active_gate.clamp(max=self.n_gates - 1)
-        gp = self.gate_pos[self._env_ar, act_idx]
-        gn = self.gate_normal[self._env_ar, act_idx]
-        det = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=True)
+        gp = self.gate_pos[self._env_ar, act_idx]     # 報酬(接近距離)用のアクティブゲート
+        # 観測用の検出は本番YOLOXと同じく「全ゲートの中で最も大きく映る1個」。どのゲートが
+        # アクティブかは検出器に教えない(deployのVQ2ではトラック情報が来ないため)。
+        det = self.detector.detect_scene(state["pos_ned"], state["quat_ned"],
+                                         self.gate_pos, self.gate_normal, noise=True,
+                                         pillar_xy=self.pillar_xy,
+                                         pillar_valid=self.pillar_valid)
         self.det_queue.push(det)
 
         obs, priv, closeness = self._build_obs(state, actions)
@@ -504,12 +529,15 @@ class GenesisRaceEnv:
         reward = self.rewards.compute(
             gate_pass=self.gate_pass_flag, finish=finish, collision=self.collision,
             d_prev=self.d_prev, d_now=d_now, closeness=closeness, path_view=path_view,
-            action=actions, last_action=self.last_action,
-            omega_norm=state["omega_frd"].norm(dim=1), wrong_way=self.wrong_way_flag,
+            action=actions, last_action=self.last_action, last_action2=self.last_action2,
+            omega=state["omega_frd"], prev_omega=self.prev_omega,
+            wrong_way=self.wrong_way_flag,
             episode_t=episode_t, max_episode_s=cfg.max_episode_s,
         )
         self.d_prev = d_now.clone()
+        self.last_action2 = self.last_action
         self.last_action = actions.clone()
+        self.prev_omega = state["omega_frd"].clone()
 
         # --- 終端 ---
         timeout_gate = self.steps_since_gate > int(cfg.no_gate_timeout_s * C.PHYS_HZ)
@@ -704,6 +732,20 @@ class GenesisRaceEnv:
                                 envs_idx=idx, zero_velocity=True, relative=False)
             self._glow_vis[idx, k] = vis
 
+    def _to_obs_res(self, rgb_u8: torch.Tensor) -> torch.Tensor:
+        """(N,H,W,3) uint8 → (N,obs_res,obs_res,3) uint8。deployと同じ全面リサイズ。
+
+        本番は 640x360 のJPEGを cv2.resize(...,(224,224)) でアスペクトを潰して224角にする。
+        学習も同じ 640x360 からの縮小にしないと、エンコーダから見た鮮鋭度/エイリアスが
+        別ドメインになる(旧: 320x180 を224へ拡大していた)。
+        """
+        if rgb_u8.shape[1] == self.obs_res and rgb_u8.shape[2] == self.obs_res:
+            return rgb_u8
+        x = rgb_u8.permute(0, 3, 1, 2).float()
+        x = torch.nn.functional.interpolate(x, size=(self.obs_res, self.obs_res),
+                                            mode="bilinear", align_corners=False)
+        return x.clamp(0.0, 255.0).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
     def _apply_photo_dr(self, rgb_u8: torch.Tensor) -> torch.Tensor:
         """per-env測光変換: ガンマ→コントラスト→per-channelゲイン→輝度オフセット→ノイズ。
 
@@ -789,7 +831,10 @@ class GenesisRaceEnv:
         passed = (self.active_gate - 1).clamp(min=0, max=C.MAX_GATES - 1)
         onehot = torch.nn.functional.one_hot(passed, C.MAX_GATES).float()
         vec[:, C.VEC_ONEHOT] = onehot
-        vec[:, C.VEC_LAST_ACTION] = self.last_action
+        # last_action は「直前に出したアクション」= 引数の actions。self.last_action は
+        # このメソッドの後で更新されるため、そちらを使うと1決定ぶん古い a_{t-2} が載り、
+        # deploy(a_{t-1}を載せる)と33msズレる(2026-07-26に実測で確認した旧バグ)。
+        vec[:, C.VEC_LAST_ACTION] = actions
 
         obs = {"rgb": self.img_queue.read(), "vec": vec}
 
@@ -822,7 +867,7 @@ class GenesisRaceEnv:
                 state["omega_frd"] / C.RATE_SCALE,
                 (rel3_body / C.GATE_REL_SCALE).reshape(N, 9),
                 torch.sin(dyaw), torch.cos(dyaw),
-                self.last_action,
+                actions,
                 (t_since_gate / self.cfg.no_gate_timeout_s).clamp(0, 1).unsqueeze(1),
                 (ep_t / self.cfg.max_episode_s).clamp(0, 1).unsqueeze(1),
                 (self.active_gate.float() / self.n_gates).unsqueeze(1),
@@ -835,7 +880,11 @@ class GenesisRaceEnv:
         # 真値closeness(報酬用・ノイズなし)
         gp = self.gate_pos[self._env_ar, act]
         gn = self.gate_normal[self._env_ar, act]
-        det_true = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=False)
+        # 報酬用のclosenessも遮蔽込みで評価する(柱越しに「見えている」ことにすると、
+        # 実際には映らない位置取りを強化してしまうため)
+        det_true = self.detector.detect(state["pos_ned"], state["quat_ned"], gp, gn, noise=False,
+                                        pillar_xy=self.pillar_xy,
+                                        pillar_valid=self.pillar_valid)
         closeness = (1.0 - det_true[:, 3]) * det_true[:, 2]
 
         return obs, priv, closeness

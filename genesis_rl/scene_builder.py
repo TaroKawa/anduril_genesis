@@ -88,17 +88,19 @@ def sample_colors(rng: np.random.Generator, color_dr: bool) -> SceneColors:
         gate = colorsys.hsv_to_rgb(gate_h / 360.0, rng.uniform(0.7, 1.0), rng.uniform(0.9, 1.0))
         ribbon = colorsys.hsv_to_rgb(rng.uniform(185.0, 215.0) / 360.0, rng.uniform(0.8, 1.0), rng.uniform(0.7, 1.0))
         glow = colorsys.hsv_to_rgb(rng.uniform(36.0, 84.0) / 360.0, rng.uniform(0.7, 1.0), rng.uniform(0.8, 1.0))
-        ambient = rng.uniform(0.005, 0.04)         # 実機は暗环境(黒地に発光)。明るい絵は出さない
+        # 実機は暗環境だが中間調(V 25-120)が48%ある(灰色の柱/トラス/機体が薄く見える)。
+        # ambientを上げすぎると白モヤ、下げすぎると黒潰れ。露出2.6込みで較正した帯域。
+        ambient = rng.uniform(0.018, 0.045)
         # 実DCLは明部(V>=120)が画素の10%(リボン路面・天井灯・ゲートのブルーム)。
         # フィルは明るく(実測リボン帯 mean RGB(32,112,143)、max飽和)
-        fill_gain = float(rng.uniform(0.7, 1.05))
-        fill_op = float(rng.uniform(0.28, 0.5))
+        fill_gain = float(rng.uniform(0.85, 1.15))
+        fill_op = float(rng.uniform(0.35, 0.56))
     else:
         gate = (1.0, 0.24, 0.22)      # 実機のネオン赤(彩度高)。白ロゴ/ハロが白飛び側を担う
         ribbon = (0.1, 0.85, 1.0)
         glow = (1.0, 0.8, 0.15)
-        ambient = 0.02
-        fill_gain, fill_op = 0.85, 0.38
+        ambient = 0.03
+        fill_gain, fill_op = 0.97, 0.47
     return SceneColors(gate_rgb=gate, ribbon_rgb=ribbon, glow_rgb=glow, ambient=ambient,
                        ribbon_fill_gain=fill_gain, ribbon_fill_op=fill_op)
 
@@ -154,8 +156,8 @@ class SceneBuilder:
         # 床(平面): 実測の床領域は RGB≈(27,49,58) と青被りの暗灰(リボン/天井灯の照り返し)。
         # ラスタライザにGIは無いので、床自体に微弱な青系の自発光を持たせて照り返しを近似する。
         # 値は露出ゲイン(render.exposure≈2.6)込みで実測に合うよう逆算した帯域。
-        f = float(self.rng.uniform(0.005, 0.014))
-        e = float(self.rng.uniform(0.007, 0.017))
+        f = float(self.rng.uniform(0.008, 0.02))
+        e = float(self.rng.uniform(0.02, 0.045))
         ent = scene.add_entity(gs.morphs.Plane(), surface=gs.surfaces.Rough(
             color=(f, f * 1.3, f * 1.6), emissive=(e * 0.5, e * 1.0, e * 1.25)))
         self.static_entities.append(ent)
@@ -200,7 +202,7 @@ class SceneBuilder:
             self._static(
                 scene, gs,
                 gs.morphs.Box(pos=(x, y, hall.height / 2), size=(1.5, 1.5, hall.height), fixed=True),
-                (0.05, 0.05, 0.055),   # 実映像の柱はほぼ黒
+                (0.09, 0.09, 0.10),   # 実映像の柱は黒地に浮く暗灰(中間調48%の一部)
             )
             # "Station XX"サイン: 柱の面に縦長の白い淡発光ストリップ(縦書きテキストの輝度分布を近似)
             if self.rng.random() < 0.75:
@@ -592,7 +594,7 @@ class SceneBuilder:
             gs.morphs.Box(pos=(0, 0, -100), size=(1.5, 1.5, hall.height),
                           fixed=False, collision=False),
             material=gs.materials.Rigid(rho=1.0, gravity_compensation=1.0),
-            surface=gs.surfaces.Rough(color=(0.05, 0.05, 0.055))) for _ in range(n_max)]
+            surface=gs.surfaces.Rough(color=(0.09, 0.09, 0.10))) for _ in range(n_max)]
         self._pool(ents, pos_c, quat_c, valid_c)
 
     def _pool_signs(self, scene, gs, specs, K):

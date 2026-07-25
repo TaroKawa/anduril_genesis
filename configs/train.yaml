@@ -21,8 +21,14 @@ env:
   course_pool: 512      # per-env時のコース種類数(0=envごとにユニーク=num_envs種)
   render:
     backend: batch      # gs_madrona(genesis依存に同梱)。ネイティブLinuxで有効
-    width: 320
-    height: 180
+    # 本番と同一解像度でレンダし、方策へ渡す前に obs_res(224)へ縮小する。deploy は
+    # 640x360のJPEGを cv2.resize(...,(224,224)) で潰すので、学習も「640→224の縮小」に
+    # 揃えないとエンコーダから見て別ドメインになる(旧320x180は224への"拡大"だった)。
+    # コスト: レンダ画素が4.6倍。スループットが足りなければ num_envs を 1024→512 へ下げる
+    # (遅延キューは224で持つのでVRAMはむしろ減る)。
+    width: 640
+    height: 360
+    obs_res: 224
     max_seq_envs: 8     # batch不可時(sequential)のフォールバック上限
     photo_dr: 1.0       # 測光DR(ガンマ/ゲイン/コントラスト/ノイズをper-env・エピソード毎)。
                         # latest.pt世代はMadronaの絵に視覚過適合し、レンダ実装が変わるだけで
@@ -37,6 +43,11 @@ sac:
   success_capacity: 500000 # RLPD成功バッファ(約6GB)
   n_step: 3
   success_ratio: 0.5
+  # SACの目標エントロピー。既定の -4.0(=-1.0/次元)は探索ノイズが大きく、収束後も
+  # 方策の分散が残って機体が細かく震える一因になる。-6.0(=-1.5/次元)へ下げて
+  # 決定論寄りにする(報酬側の jerk/ang_acc ペナルティと合わせて振動を抑える)。
+  # 探索が足りずstage進級が止まる場合は -5.0 へ戻す。
+  target_entropy: -6.0
   burn_in_steps: 50000
   learn_start: 20000
   replay_ratio_cap: 8.0     # learnerのUTD上限(=過学習防止)。7collectorのデータ律速では通常この下で回る

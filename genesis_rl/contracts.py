@@ -120,10 +120,13 @@ def to_resnet(rgb_u8: torch.Tensor) -> torch.Tensor:
 
 def contract_hash() -> str:
     """契約のバージョンハッシュ。checkpointに保存しresume/転移時に照合する。"""
+    # sem: レイアウトは同じでも意味が変わったら上げる(古いckptの誤ロードを防ぐ)。
+    #   sem2 (2026-07-26): last_action を a_{t-1} に修正 / ゲート検出を全ゲート面積最大選択へ /
+    #   rel_dist に実bbox倍率1.10 / 観測画像を640x360から224へ縮小 / 遅延2-3フレーム。
     spec = (
         f"vec{VEC_DIM}-priv{PRIV_DIM}-act{ACTION_DIM}"
         f"-rate{RATE_LIMITS}-thr{THRUST_CENTER}+-{THRUST_HALFSPAN}"
         f"-hz{POLICY_HZ}-res{RESNET_RES}-maxg{MAX_GATES}"
-        f"-{ENCODER_NAME}-feat{FEAT_DIM}-hist{HIST_K}"
+        f"-{ENCODER_NAME}-feat{FEAT_DIM}-hist{HIST_K}-sem2"
     )
     return hashlib.sha256(spec.encode()).hexdigest()[:16]

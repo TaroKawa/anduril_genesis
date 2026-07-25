@@ -4,7 +4,8 @@ from genesis_rl.training.nstep import NStepAssembler
 
 
 def _mk(n_envs=2, n=3, gamma=0.9):
-    return NStepAssembler(n_envs, n, gamma, vec_dim=1, priv_dim=1, act_dim=1, feat_dim=1,
+    # vec/feat は履歴窓 (K,D) を取るのでshapeで渡す(ここでは最小の (1,))
+    return NStepAssembler(n_envs, n, gamma, vec_shape=1, priv_dim=1, act_dim=1, feat_shape=1,
                           device=torch.device("cpu"))
 
 

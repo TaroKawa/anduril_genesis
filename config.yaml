@@ -85,9 +85,18 @@ sensor:
   det_dropout_base:  0.02
   det_dropout_close: 0.10
   det_outlier_p:     0.01
-  det_delay_frames:  1
+  # YOLOX-x の実bbox面積は幾何投影 (FX·2.7/d)² の1.10倍(既知距離レンダで実測 2026-07-26)。
+  # 学習側でこの倍率を掛けておくと deploy は契約値 gate_area_max=150000 のままで rel_dist が
+  # 一致する(旧: deploy側で25000へ下げる誤較正 → 同距離でrel_distが6倍小さかった)。
+  det_bbox_gain:     1.10
+  # deploy の GateYOLOX min_area[px²]。これ未満のbboxは捨てられる(=遠方ゲートが不可視に)。
+  # 500px² は約39m相当。学習側も距離ではなく見かけ面積で可視判定して規約を揃える。
+  det_min_area:      500.0
+  # 遅延[決定フレーム @30Hz]。実機の実測は映像85ms・検出も同一フレーム由来なので同じ段数。
+  # 1段(33ms)だと age_n が学習0.07 vs 実機0.17 でズレる(2026-07-26 実測)。2+jitter1 → 67-100ms。
+  det_delay_frames:  2
   det_delay_jitter:  1
-  img_delay_frames:  1
+  img_delay_frames:  2
   img_delay_jitter:  1
   act_delay_steps:   0
   act_delay_jitter:  1
@@ -104,7 +113,12 @@ deploy:
   use_rad_per_sec_body_rates: true  # bit16(rev3390 rad/s)。旧ckptを飛ばす時のみ false
   rate_plant_gain_rads: [1.0, 1.0, 0.89]  # bit16時の実機レート・プラントゲイン(送信スケール分母)
   rate_cmd_gain:        [2.44, 2.46, 2.18]  # レガシー(bit16 off)時のプラントゲイン
-  real_gate_area_max:   25000.0     # 実YOLOX/HSVのrel_dist較正(投影より小さい分)
+  # rel_dist = 1 - bbox面積/これ。学習側 SimGateDetector は s_px=FX·2.7/d の幾何投影を
+  # 契約値150000で割る。YOLOX-xの実bbox面積を既知距離のレンダで実測したところ幾何投影の
+  # 1.10倍(2/5/8m×9ゲート、2026-07-26)で、旧値25000は6倍過小 → 同じ距離でrel_distが
+  # 極端に小さく出ていた(実飛行ログ runs/dcl_fable_0724b: rel_dist平均0.38・p10=0.00 に対し
+  # Genesis学習時は平均0.82・p10=0.50)。方策は「もうゲート直前」と誤認し続けていた。
+  real_gate_area_max:   150000.0    # = contracts.GATE_AREA_MAX(契約どおり)
   start_thrust:         0.265       # ピン解除前に出す推力(= takeoff_thrust)
   gyro_obs_sign:        [-1.0, -1.0, -1.0]  # 生HIGHRES_IMU gyro→観測 の符号
   accel_obs_sign:       [1.0, 1.0, 1.0]
