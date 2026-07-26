@@ -153,9 +153,24 @@ class CourseGenerator:
         # フルレンジ: DCL相当の急旋回を増やす。dpsi_max=110°(ゲートyawは進入/退出の円平均なので
         # 110°ターンでも各面55°<70°で通過可)、sharp_p=0.4。blind=Trueで通過直後に次ゲートが
         # 視界外(HFOV=90°/±45°、110°ターンで平行姿勢からbearing≈55°)へ出る旋回を強制する。
+        if self.stage == 3:
+            return dict(dpsi_max=np.radians(110), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
+                        n_gates=self.n_gates, seg=(6.0, 13.0),
+                        tilt=np.radians(12), sharp_p=0.4, min_gap=6.0, blind=True, clearance=3.5)
+        # stage4,5: フルの難度(急旋回/blind/climb)を保ったままゲート間隔の下限を狭める。
+        # 下限を実際に効かせるには min_gap(3D最短距離) と seg[0](区間長下限) と clearance
+        # (自己交差の最短点-区間距離)を一緒に下げる必要がある(どれか1つだと他が律速する)。
+        # far_frac<1で奥行き予算(target_dn)を圧縮しないと、seg[0]/min_gapを下げても
+        # ゲートは奥行き均等割りで~4.7m間隔に広がり下限が効かない(stage1と同じ手法)。
+        if self.stage == 4:
+            return dict(dpsi_max=np.radians(110), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
+                        n_gates=self.n_gates, seg=(4.5, 13.0), far_frac=0.72,
+                        tilt=np.radians(12), sharp_p=0.4, min_gap=4.5, blind=True, clearance=3.0)
+        # stage>=5: ゲート間隔の下限~3m(DCL相当の密なコース)。frame外形2.7mなので3m中心では
+        # 枠間0.3m=傾き次第で視覚的に近接するが、per-env数値衝突はアクティブゲートのみ判定。
         return dict(dpsi_max=np.radians(110), z_range=(1.5, 4.5), climbs=int(rng.integers(1, 4)),
-                    n_gates=self.n_gates, seg=(6.0, 13.0),
-                    tilt=np.radians(12), sharp_p=0.4, min_gap=6.0, blind=True)
+                    n_gates=self.n_gates, seg=(3.0, 13.0), far_frac=0.50,
+                    tilt=np.radians(12), sharp_p=0.4, min_gap=3.0, blind=True, clearance=2.5)
 
     def _try_generate(self, rng, force_blind: bool = True) -> CourseSpec | None:
         """始点(ホール手前)→終点(奥)へ縦方向に進行するコース。
@@ -253,8 +268,9 @@ class CourseGenerator:
                 if any(np.linalg.norm(cand - c) < p["min_gap"] for c in centers):
                     continue
                 # 自己交差防止: 新ゲートが既存セグメントに近すぎない/新セグメントが
-                # 既存ゲートに近すぎない(コースが他ゲートの枠を突き抜けるのを防ぐ)
-                clearance = 3.5
+                # 既存ゲートに近すぎない(コースが他ゲートの枠を突き抜けるのを防ぐ)。
+                # 間隔を詰めるstage(4,5)では下限(min_gap)未満で弾かないよう per-stage 値を使う。
+                clearance = p.get("clearance", 3.5)
                 if any(_point_seg_dist(cand, centers[j], centers[j + 1]) < clearance
                        for j in range(len(centers) - 1)):
                     continue

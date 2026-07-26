@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 
+import numpy as np
+
 
 class TrainLogger:
     def __init__(self, ckpt_dir: str | Path):
@@ -17,6 +19,9 @@ class TrainLogger:
         self.ep_return = deque(maxlen=2000)
         self.ep_spawn_gate = deque(maxlen=2000)
         self.ep_spawn_dist = deque(maxlen=2000)
+        # 失敗モードの内訳(なぜ/どこでエピソードが終わるか)。done=collision|finish|timeout。
+        self.ep_collision = deque(maxlen=2000)
+        self.ep_finish = deque(maxlen=2000)
         self._resume_prob = None
         self._stage = None
         self._history = {"transitions": [], "gates": [], "success": [], "return": []}
@@ -29,6 +34,10 @@ class TrainLogger:
             self.ep_spawn_gate.append(info["spawn_gate"])
         if "spawn_dist_g1" in info:
             self.ep_spawn_dist.append(info["spawn_dist_g1"])
+        if "collision" in info:
+            self.ep_collision.append(1.0 if info["collision"] else 0.0)
+        if "finish" in info:
+            self.ep_finish.append(1.0 if info["finish"] else 0.0)
         self._resume_prob = info.get("resume_prob", self._resume_prob)
         self._stage = info.get("stage", self._stage)
 
@@ -54,6 +63,24 @@ class TrainLogger:
             stats["curriculum/resume_prob"] = self._resume_prob
         if self._stage is not None:
             stats["curriculum/stage"] = self._stage
+        # 失敗モードの内訳: なぜエピソードが終わったか(衝突/完走/タイムアウト)。
+        # done = collision | finish | timeout なので timeout = ~collision & ~finish。
+        if self.ep_collision and self.ep_finish:
+            col = sum(self.ep_collision) / len(self.ep_collision)
+            fin = sum(self.ep_finish) / len(self.ep_finish)
+            stats["episode/collision_rate"] = col
+            stats["episode/finish_rate"] = fin
+            stats["episode/timeout_rate"] = max(0.0, 1.0 - col - fin)
+        # どこで落ちたか: 通過ゲート数の分布(p10/p50=中央値)。gates_meanだけだと分からない。
+        if self.ep_gates:
+            sg = sorted(self.ep_gates)
+            stats["episode/gates_p50"] = sg[len(sg) // 2]
+            stats["episode/gates_p10"] = sg[max(0, len(sg) // 10)]
+            try:
+                self.tb.add_histogram("episode/done_gates",
+                                      np.array(self.ep_gates, dtype=float), transitions)
+            except Exception:
+                pass
         self.log_scalars(transitions, stats)
         h = self._history
         h["transitions"].append(transitions)

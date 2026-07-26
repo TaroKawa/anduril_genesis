@@ -171,7 +171,7 @@ class SacConfig:
 class CurriculumConfig:
     enabled: bool = True
     window: int = 200                     # trailing成功率の窓
-    thresholds: tuple = (0.7, 0.7, 0.7, 0.6, 0.5)  # stage0→1,1→2,2→3,3→4,4→5
+    thresholds: tuple = (0.7, 0.7, 0.7, 0.6, 0.5, 0.8, 0.8)  # 0→1…4→5, 5→6, 6→7(間隔漸減stage)
     rebuild_episodes: int = 300           # シーン再構築(コース/色DR)間隔
     seed_pool: int = 32                   # Stage3+のコースシード数
     resume_hi: float = 0.8                # 逆カリキュラム: 成功率0時の途中スポーン確率(閾値到達で各stageの下限へ線形減衰)

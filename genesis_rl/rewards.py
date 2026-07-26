@@ -25,8 +25,11 @@ class RewardWeights:
     #            (レート追従ループの発振・DRで効きが変わったときに効く)
     smooth: float = -0.06     # アクション平滑化 ‖Δa‖²(旧-0.02)
     jerk: float = -0.20       # アクション二次差分 ‖a-2a₋₁+a₋₂‖²(振動の主ペナルティ)
-    ang_acc: float = -0.05    # 角加速度 (‖ω-ω₋₁‖/6)²
-    rate: float = -0.02       # レートペナルティ (‖ω‖/6)²(rate_max=6 に整合。旧-0.01)
+    # ang_acc/rate を緩和(2026-07-26 success_rate向上): 抗振動の主役は jerk/smooth(指令の
+    # 往復)であり、ang_acc/rate は「機体が速く/強く旋回する」こと自体への持続的な罰。終盤の
+    # 詰まったゲート列で必要な機敏な旋回を抑制していたため下げる(jerk/smoothは温存し発振は防ぐ)。
+    ang_acc: float = -0.03    # 角加速度 (‖ω-ω₋₁‖/6)²(旧-0.05)
+    rate: float = -0.01       # レートペナルティ (‖ω‖/6)²(旧-0.02。攻めた旋回を許容)
     wrong_way: float = -5.0   # 逆走(非終端)
     speed_finish: float = 0.0 # Stage4: 完走時間ボーナス w*(60-T)/60(カリキュラムが設定)
     approach_clip: float = 3.0  # 1決定あたりの接近クリップ [m]
