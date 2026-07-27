@@ -54,9 +54,10 @@ HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(参考値)
 # VQ1真値テレメトリで実測したホバー推力(A==g)。2026-07-27 runs/vq1_fit_0727 の
 # 推力階段(0.205〜0.31の6水準)で A = g·(thrust/0.2694)^1.55 (log残差1%)。同定プランの基準点。
 MEASURED_HOVER = uc("deploy", "measured_hover", 0.2694)
-# スタート出力=ピン解除の閾値。ピン解除前(pin_released=False)はこの値を出す。thrustレンジの
-# 下端(0.239)は下降用に下げたが、スタートでそれを出すとピンが外れず発進できないため、
-# ピン中は必ず 0.265 を出す(方策はピン解除後にのみ介入する)。
+# 発進のためにピン中に出しておく推力。VQ1実測(2026-07-28 scripts/probe_start.py)で
+# **thrust > 約0.18 の SET_ATTITUDE_TARGET が届いた時点で拘束が解ける**ことが判明した
+# (レースのカウントダウンやARMとは無関係。閾値未満だと姿勢指令も一切効かない)。
+# 0.265 は閾値に対して十分上でホバー(0.2665)相当なので、発進時に沈まない。
 START_THRUST = uc("deploy", "start_thrust", 0.265)   # = contracts.TAKEOFF_THRUST
 CONTROL_HZ = 250.0             # コマンド送信レート(シム仕様。構造値)
 VIDEO_W, VIDEO_H = 640, 360
@@ -202,6 +203,9 @@ class MavlinkIO:
             "race_finished": bool(finished),
             "released_at": released_at,
             "t_wall": time.time(),
+            # 生値(カウントダウン残りの算出・スタート条件の調査に使う)
+            "sim_boot_ms": int(sim_boot_ms),
+            "race_start_ms": (int(race_start_ms) if race_start_ms is not None else None),
         }
 
     def _on_track_packet(self, msg, raw):

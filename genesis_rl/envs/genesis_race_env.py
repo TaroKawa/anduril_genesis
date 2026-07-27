@@ -177,6 +177,18 @@ class GenesisRaceEnv:
         self.resume_prob = 0.0                            # カリキュラムStage1+で>0
         self.required_gates = 1
         self._all_idx = torch.arange(N, device=self.device)
+        # --- 発進拘束(ピン)。実シムの発進仕様を再現する。VQ1実測(2026-07-28):
+        #   ・スポーン後は位置も姿勢も完全に固定され、加速度計は 1.00g(重力反力)
+        #   ・thrust > 約0.18 の SET_ATTITUDE_TARGET が届いた時点で解除される
+        #     (レースのカウントダウンやARMとは無関係。閾値未満だと姿勢指令も効かない)
+        #   ・解除後は低推力も普通に効く = 閾値はスタート専用
+        self.pinned = z(N, dtype=torch.bool)
+        self.pin_timer = z(N, dtype=torch.long) - 1        # >=0 で解除カウントダウン中
+        self.pin_pos = z(N, 3)
+        self.pin_quat = z(N, 4)
+        self.pin_release_steps = max(int(round(cfg.pin_release_delay_s * C.PHYS_HZ)), 0)
+        # 発進はルールベース: 拘束中は方策を使わずこの推力を出す(deploy の START_THRUST と同値)
+        self.pin_start_thrust = float(getattr(cfg, "pin_start_thrust", C.TAKEOFF_THRUST))
         self._static_geom_start = None                    # 衝突フィルタ用(ドローン以外は全てstatic)
         # 測光DR(cfg.render.photo_dr>0時のみ使用): per-envのゲイン/ガンマ/コントラスト/ノイズ
         self._photo_gain = torch.ones(N, 1, 1, 3, device=self.device)
@@ -440,6 +452,14 @@ class GenesisRaceEnv:
 
         quat = quat_from_euler_frd_ned(roll, pitch, yaw)
         self.drone.set_state(pos, quat, envs_idx)
+        # 発進拘束: 正規スタートのみ(途中スポーン=既に飛んでいる想定なので拘束しない)
+        pin = torch.full((n,), bool(cfg.pin_start), device=dev, dtype=torch.bool)
+        if self.resume_prob > 0.0 and self.n_gates > 2:
+            pin &= ~resume
+        self.pinned[envs_idx] = pin
+        self.pin_timer[envs_idx] = -1
+        self.pin_pos[envs_idx] = pos
+        self.pin_quat[envs_idx] = quat
         self.drone.reset_idx(envs_idx, dr=True)
         self.imu.reset_idx(envs_idx)
         self.rewards.reset_idx(envs_idx)
@@ -481,6 +501,46 @@ class GenesisRaceEnv:
         rel = pos - gp
         self.prev_x_rel[envs_idx] = (rel * self.gate_normal[envs_idx, active]).sum(dim=1)
 
+    # --- 発進拘束(ピン) ---
+
+    def _apply_pin(self, cmd: torch.Tensor) -> torch.Tensor:
+        """発進(ピン解除)だけは方策を使わず **ルールベースの固定指令** で行う。
+
+        実機deploy([dcl/client.py])も同じ構造で、ピン解除まで方策を呼ばず
+        START_THRUST(=action.takeoff_thrust)を出し続ける。学習側もそれに揃えることで
+        「発進の仕方」を方策に学ばせずに済み、a3=0 が解除閾値(0.18)未満でも確実に発進する。
+
+        実シムの実測仕様(VQ1 2026-07-28):
+          ・拘束中は位置も姿勢も完全固定、加速度計は 1.00g(重力反力)
+          ・thrust > pin_release_thrust の指令が届いてから約 pin_release_delay_s で解除
+          ・閾値未満では姿勢指令も一切効かない
+        なので印加は0のまま(=比力0→ImuSimが重力反力を出す)にし、解除判定だけを
+        固定発進推力 pin_start_thrust で行う。
+        """
+        if not bool(self.pinned.any()):
+            return cmd
+        cfg = self.cfg
+        # 判定に使うのは方策の推力ではなく固定の発進推力(設定ミスならここで発進しない)
+        if self.pin_start_thrust > cfg.pin_release_thrust:
+            trig = self.pinned & (self.pin_timer < 0)
+            self.pin_timer[trig] = self.pin_release_steps
+        counting = self.pinned & (self.pin_timer >= 0)
+        self.pin_timer[counting] -= 1
+        self.pinned[counting & (self.pin_timer < 0)] = False
+        return torch.where(self.pinned.unsqueeze(1), torch.zeros_like(cmd), cmd)
+
+    def _hold_pinned(self) -> None:
+        """物理ステップ後、拘束中のenvをスポーン姿勢へ戻す(位置・姿勢とも完全固定)。
+
+        指令を0にしてあるので推力・ドラッグ・トルクは印加されず、残るのは重力だけ。
+        それをここで打ち消す。DroneModel.last_specific_force_frd も 0 のままなので
+        ImuSim は「支持された静止状態」として重力反力(=1.00g)を出す(実測と一致)。
+        """
+        if not bool(self.pinned.any()):
+            return
+        idx = self.pinned.nonzero(as_tuple=False).squeeze(-1)
+        self.drone.set_state(self.pin_pos[idx], self.pin_quat[idx], idx)
+
     # --- ステップ ---
 
     def step(self, actions: torch.Tensor):
@@ -496,8 +556,10 @@ class GenesisRaceEnv:
         for k in range(C.DECIMATION):
             use_new = (self.act_delay <= k).unsqueeze(1)
             cmd = torch.where(use_new, cmd_new, self.prev_cmd)
+            cmd = self._apply_pin(cmd)
             self.drone.apply(cmd, state)
             self.scene.step()
+            self._hold_pinned()
             state = self.drone.state()
             # IMU(比力はDroneModelが印加力から解析計算)
             self.imu.tick_analytic(state["quat_ned"], self.drone.last_specific_force_frd,

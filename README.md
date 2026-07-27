@@ -113,6 +113,39 @@ python -m genesis_rl.scripts.compare_builds --vq1 runs/vq1_fit --vq2 runs/vq2_fi
 `--optimize` は診断用。パラメータ間に縮退があり(遅延↔k_rate など)、中央値だけ下げて
 裾を悪化させることがある。**採用値は analyze_truth の直接同定を一次ソースにする**。
 
+### 発進(ピン解除)の仕様 — 2026-07-28 実測
+
+`python -m genesis_rl.scripts.probe_start --no-relay` で条件を切り分けた結果:
+
+| 条件 | 結果 |
+|---|---|
+| 何も送らない | **動かない**(位置も姿勢も3秒以上まったく変化なし。加速度計は 1.00g=重力反力) |
+| thrust 0 / 0.01 / 0.05 / 0.10 | **動かない**。しかも**姿勢指令も一切効かない**(roll 0.5rad/s を3秒入れて0.0°) |
+| 推力ランプ 0.08→0.24 | **0.183 で解除**(3回とも一致。遅延を差し引いて閾値 ≈ **0.18**) |
+| thrust 0.20 / 0.24 / 0.265 / 0.30 | 動く |
+| ARM しない | 動く → **ARM は解除に不要** |
+| レースのカウントダウン | **無関係**。開始フラグの2.5〜3.0秒 *前* に解除されるし、フラグ後2秒に送り始めれば その時に解除される |
+| 解除後に thrust 0.05 へ落とす | 普通に効く(roll応答 0.477 / 指令0.5、A も低下) → **閾値はスタート専用** |
+
+つまり **発進の引き金は「thrust > 約0.18 の `SET_ATTITUDE_TARGET` を送ること」だけ**。
+レース開始フラグは計時の開始点であって、物理的な拘束の解除ではない。
+解除の遅れは指令到達から約0.07秒。
+
+自作シム側に同じ挙動を実装済み(`env_physics.pin_start` / `pin_release_thrust` /
+`pin_release_delay_s` / `pin_start_thrust`、
+[genesis_race_env.py](anduril_genesis/genesis_rl/envs/genesis_race_env.py) の
+`_apply_pin` / `_hold_pinned`)。拘束中は指令を無効化してスポーン姿勢へ固定し続けるので、
+IMUは「支持された静止状態」として重力反力(1.00g)を出す = 実測と一致する。
+途中スポーン(逆カリキュラム)は既に飛んでいる想定なので拘束しない。
+状態機械は [tests/test_pin_start.py](anduril_genesis/genesis_rl/tests/test_pin_start.py) で固定。
+
+**発進はルールベース**(方策には学ばせない)。拘束中は方策の出力を使わず
+`pin_start_thrust`(=`action.takeoff_thrust`=0.265)を出す固定動作で解除する。実機deploy
+([dcl/client.py](anduril_genesis/genesis_rl/dcl/client.py))がピン解除まで方策を呼ばず
+`START_THRUST` を出し続けるのと同じ構造で、学習と実機で発進手順が一致する。
+`action.thrust_center=0.175` は解除閾値0.18の *すぐ下* だが、発進が固定動作なので影響しない
+(`pin_start_thrust` を閾値以下に下げると実シム同様に永久拘束になる — テストで固定済み)。
+
 ### VQ1→VQ2 の橋渡し検証(2026-07-28 実施・**同一プラントと確認**)
 
 同じ指令列を両ビルドへ入れ、両方で観測できる信号(HIGHRES_IMU / ACTUATOR)だけを比較した

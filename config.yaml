@@ -139,6 +139,21 @@ env_physics:
   spawn_below_center: 0.3
   spawn_pitch_deg:    -17.8         # 前傾(実測)
   spawn_jitter_deg:   2.0
+  # --- 発進拘束(ピン)。VQ1実測 2026-07-28 (scripts/probe_start.py) ---
+  # 実シムはスポーン後、位置も姿勢も *完全に固定* される(加速度計は1.00g=重力反力)。
+  # 解除の引き金は「thrust > 約0.18 の SET_ATTITUDE_TARGET が届くこと」だけ:
+  #   ・何も送らない/thrust≤0.10 → 3秒以上まったく動かない(姿勢指令も効かない)
+  #   ・推力ランプ計測で 0.183 で解除(3回一致、遅延補正で 0.180)
+  #   ・レースのカウントダウン(開始フラグ)とは無関係。フラグの3秒前でも解除されるし、
+  #     フラグ後2秒に送り始めればその時に解除される。ARM も不要
+  #   ・解除後は thrust 0.05 でも普通に効く(roll応答 0.477/0.5) = 閾値はスタート専用
+  # **発進はルールベース**: 拘束中は方策を使わず pin_start_thrust を出す(実機deployの
+  # START_THRUST と同じ構造)。方策に発進の仕方を学ばせる必要がなく、a3=0 が解除閾値
+  # (0.18)未満でも必ず発進できる。pin_start_thrust は takeoff_thrust と同値に保つこと。
+  pin_start:          true          # falseで従来どおり即飛行開始(拘束なし)
+  pin_release_thrust: 0.18
+  pin_release_delay_s: 0.07         # 指令到達から解除までの遅れ(late試行から)
+  pin_start_thrust:   0.265         # = action.takeoff_thrust = deploy.start_thrust
 
 # --- 本番シム推論(デプロイ)。dcl/client.py ---
 deploy:

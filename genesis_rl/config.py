@@ -123,6 +123,13 @@ class EnvConfig:
     spawn_below_center: float = uc("env_physics", "spawn_below_center", 0.3)  # 中心からの下[m]
     spawn_pitch_deg: float = uc("env_physics", "spawn_pitch_deg", -17.8)      # 前傾(実測)
     spawn_jitter_deg: float = uc("env_physics", "spawn_jitter_deg", 2.0)
+    # 発進拘束(ピン)。実シムはスポーン後 *完全に固定* され、thrust>閾値の指令が来て
+    # 初めて解除される(VQ1実測 2026-07-28。カウントダウン/ARMは無関係)。
+    pin_start: bool = uc("env_physics", "pin_start", True)
+    pin_release_thrust: float = uc("env_physics", "pin_release_thrust", 0.18)
+    pin_release_delay_s: float = uc("env_physics", "pin_release_delay_s", 0.07)
+    # 発進はルールベース: 拘束中は方策を使わずこの推力を出す(deploy の START_THRUST と同値)
+    pin_start_thrust: float = uc("env_physics", "pin_start_thrust", 0.265)
     render: RenderConfig = field(default_factory=RenderConfig)
     drone: DroneConfig = field(default_factory=DroneConfig)
     sensors: SensorConfig = field(default_factory=SensorConfig)
