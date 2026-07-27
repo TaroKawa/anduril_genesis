@@ -1,0 +1,138 @@
+ Network anduril_genesis_default Creating 
+ Network anduril_genesis_default Created 
+ Container anduril_genesis-train-run-1e91ef37cecb Creating 
+ Container anduril_genesis-train-run-1e91ef37cecb Created 
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[orchestrator] learner=GPU0  collectors=7本 → GPU割当 [1, 2, 3, 4, 5, 6, 7]
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+dt.createInstance(&inst_info, nullptr, &inst): ERROR_INCOMPATIBLE_DRIVER
+Error at /project/src/render/vk/backend.cpp:386 in static Backend::Init madrona::render::vk::Backend::Init::init(PFN_vkGetInstanceProcAddr, bool, Span<const char *const>)
+dt.createInstance(&inst_info, nullptr, &inst)
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+dt.createInstance(&inst_info, nullptr, &inst): ERROR_INCOMPATIBLE_DRIVER
+Error at /project/src/render/vk/backend.cpp:386 in static Backend::Init madrona::render::vk::Backend::Init::init(PFN_vkGetInstanceProcAddr, bool, Span<const char *const>)
+dt.createInstance(&inst_info, nullptr, &inst)
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+dt.createInstance(&inst_info, nullptr, &inst): ERROR_INCOMPATIBLE_DRIVER
+Error at /project/src/render/vk/backend.cpp:386 in static Backend::Init madrona::render::vk::Backend::Init::init(PFN_vkGetInstanceProcAddr, bool, Span<const char *const>)
+dt.createInstance(&inst_info, nullptr, &inst)
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+dt.createInstance(&inst_info, nullptr, &inst): ERROR_INCOMPATIBLE_DRIVER
+Error at /project/src/render/vk/backend.cpp:386 in static Backend::Init madrona::render::vk::Backend::Init::init(PFN_vkGetInstanceProcAddr, bool, Span<const char *const>)
+dt.createInstance(&inst_info, nullptr, &inst)
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+libEGL warning: egl: failed to create dri2 screen
+[orchestrator] collector 終了 (codes=[-6, None, -15, None, None, -15, None]) — exit 1 でコンテナ再起動
+
+[run] 異常終了 (exit 1) 連続1回
+ Container anduril_genesis-train-run-814baa17cdef Creating 
+ Container anduril_genesis-train-run-814baa17cdef Created 
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[orchestrator] learner=GPU0  collectors=7本 → GPU割当 [1, 2, 3, 4, 5, 6, 7]
+[learner] resumed from checkpoints/latest.pt (updates=0)
+
+[run] 中断 (exit 130)
