@@ -40,6 +40,8 @@ class ScriptedPilot:
         self.inv_cmd_gain = torch.tensor([1.0 / g for g in cg], device=device)
         self.hover = getattr(drone_cfg, "hover_thrust", C.HOVER_THRUST) if drone_cfg else C.HOVER_THRUST
         self.alpha = getattr(drone_cfg, "thrust_alpha", 2.0) if drone_cfg else 2.0
+        self.drag_c1 = getattr(drone_cfg, "drag_c", 0.0) if drone_cfg else 0.0
+        self.drag_c2 = getattr(drone_cfg, "drag_c2", 0.0) if drone_cfg else 0.0
         # 弧長テーブル
         seg = torch.linalg.norm(self.ribbon[1:] - self.ribbon[:-1], dim=1)
         self.cum = torch.cat([torch.zeros(1, device=device), torch.cumsum(seg, 0)])
@@ -66,8 +68,10 @@ class ScriptedPilot:
         turn = 1.0 - (dir_t * dir_ahead).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)  # 0=直線, 2=Uターン
         v_eff = (self.v_des * (1.0 - 0.85 * (turn / 0.5).clamp(max=1.0))).clamp(min=1.3)
         v_cmd = dir_t * v_eff
-        # P制御 + ドラッグフィードフォワード(sysid: a_drag = -0.72 v)
-        a_cmd = 1.6 * (v_cmd - vel_ned) + 0.72 * vel_ned
+        # P制御 + ドラッグフィードフォワード。VQ1真値の再同定(2026-07-27)でドラッグは
+        # ほぼ純2次 a_drag = -(c1 + c2|v|)·v になったので、線形0.72の決め打ちをやめる。
+        sp = vel_ned.norm(dim=1, keepdim=True)
+        a_cmd = 1.6 * (v_cmd - vel_ned) + (self.drag_c1 + self.drag_c2 * sp) * vel_ned
         a_cmd[:, :2] = a_cmd[:, :2].clamp(-4.0, 4.0)
         a_cmd[:, 2] = a_cmd[:, 2].clamp(-3.0, 3.0)
 

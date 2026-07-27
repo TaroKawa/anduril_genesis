@@ -79,6 +79,12 @@ THRUST_HALFSPAN = uc("action", "thrust_halfspan", 0.0306)  # → thrust ∈ [0.2
 RATE_LIMITS = uc("action", "rate_limits", (1.0, 1.0, 1.0))  # roll/pitch/yaw 指令上限 [rad/s]
 
 
+# ホバー(A==g)に対応する a3。thrust帯を広げると帯の中央≠ホバーになるので、
+# 「a3=0がホバー」を前提にしているコード(burn-inのランダム方策など)はこれを中心に使う。
+HOVER_ACTION3 = float(np.clip((HOVER_THRUST - THRUST_CENTER) / max(THRUST_HALFSPAN, 1e-9),
+                              -1.0, 1.0))
+
+
 @dataclass(frozen=True)
 class ActionMap:
     """a ∈ [-1,1]^4 → 物理コマンド (roll_rate, pitch_rate, yaw_rate [rad/s], thrust 0..1)。"""

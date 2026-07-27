@@ -33,7 +33,9 @@ def _config_path() -> Path:
 def _load() -> dict:
     p = _config_path()
     if p.exists():
-        with open(p) as f:
+        # encoding明示は必須: Windowsネイティブ実行(既定cp932)だと日本語コメントで
+        # UnicodeDecodeErrorになる。実シムのデータ取りはWindows側から直接動かす。
+        with open(p, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
 

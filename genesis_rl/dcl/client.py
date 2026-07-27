@@ -51,6 +51,9 @@ USE_RAD_PER_SEC_BODY_RATES = uc("deploy", "use_rad_per_sec_body_rates", True)  #
 # bit16 ON時の実機レート・プラントゲイン|達成/指令|。送信スケール(train/deploy)の分母。
 RATE_PLANT_GAIN_RADS = uc("deploy", "rate_plant_gain_rads", (1.0, 1.0, 0.89))
 HOVER_THRUST = 0.2742          # contracts.HOVER_THRUST(参考値)
+# VQ1真値テレメトリで実測したホバー推力(A==g)。2026-07-27 runs/vq1_fit_0727 の
+# 推力階段(0.205〜0.31の6水準)で A = g·(thrust/0.2694)^1.55 (log残差1%)。同定プランの基準点。
+MEASURED_HOVER = uc("deploy", "measured_hover", 0.2694)
 # スタート出力=ピン解除の閾値。ピン解除前(pin_released=False)はこの値を出す。thrustレンジの
 # 下端(0.239)は下降用に下げたが、スタートでそれを出すとピンが外れず発進できないため、
 # ピン中は必ず 0.265 を出す(方策はピン解除後にのみ介入する)。
@@ -104,6 +107,22 @@ class MavlinkIO:
             t = msg.get_type()
             if t == "HIGHRES_IMU":
                 self._on_imu(msg)
+            # --- VQ1(レガシー/テレメトリ有効)ビルドのみ届く真値。VQ2では1件も来ない ---
+            elif t == "ATTITUDE":
+                self._on_truth("ATT", msg.time_boot_ms * 1e-3,
+                               (msg.roll, msg.pitch, msg.yaw,
+                                msg.rollspeed, msg.pitchspeed, msg.yawspeed))
+            elif t == "LOCAL_POSITION_NED":
+                self._on_truth("POS", msg.time_boot_ms * 1e-3,
+                               (msg.x, msg.y, msg.z, msg.vx, msg.vy, msg.vz))
+            elif t == "ODOMETRY":
+                self._on_truth("ODOM", msg.time_usec * 1e-6,
+                               (msg.x, msg.y, msg.z,
+                                msg.q[0], msg.q[1], msg.q[2], msg.q[3],
+                                msg.vx, msg.vy, msg.vz,
+                                msg.rollspeed, msg.pitchspeed, msg.yawspeed))
+            elif t == "ACTUATOR_OUTPUT_STATUS":
+                self._on_truth("ACT", msg.time_usec * 1e-6, tuple(msg.actuator[:4]))
             elif t == "ENCAPSULATED_DATA":
                 raw = bytes(msg.data)
                 if raw and raw[0] == ENCAPSULATED_RACE_STATUS_MSG_ID:
@@ -133,6 +152,21 @@ class MavlinkIO:
                 self._last_collision_t = time.time()
                 print(f"COLLISION detected: |a|={a:.0f} m/s^2", flush=True)
                 self.shared["collision"] = {"t_wall": time.time(), "handled": False}
+
+    def _on_truth(self, kind: str, t_sim: float, v: tuple):
+        """真値テレメトリ1サンプル。VQ1のみ到達し、VQ2では呼ばれない(=無ければ従来動作)。
+
+        kind: ATT(roll,pitch,yaw,rollspeed,pitchspeed,yawspeed[rad,rad/s])
+              POS(x,y,z,vx,vy,vz [m,m/s] NED)
+              ODOM(x,y,z, qw,qx,qy,qz, vx,vy,vz, p,q,r)
+              ACT(motor0..3 の出力 0-1)
+        メッセージ型ごとに時刻が別クロックなので融合せず、生のまま列で残す
+        (整列は scripts/analyze_truth.py が行う)。
+        """
+        self.shared.setdefault("truth", {})[kind] = {"t_sim": t_sim, "v": v, "t_rx": time.time()}
+        log = self.shared.get("truth_log")
+        if log is not None:
+            log.append({"t_rx_wall": time.time(), "kind": kind, "t_sim": t_sim, "v": v})
 
     def _on_race_status(self, raw):
         (_, sim_boot_ms, race_start_ms, race_finish_ns,
@@ -455,7 +489,10 @@ class ScriptedRatePilot:
 
     HOVER = 0.2742          # contracts.HOVER_THRUST(A=g想定)
     TILT_HOVER = 0.281      # 17.8°前傾時に鉛直成分がgになる推力(=hover/√cos17.8°)
-    LEVEL = (1.24, 0.0, +0.1, 0.0, 0.281)   # 前傾-17.8°→水平(達成レート≈0.25rad/s)
+    # 前傾17.8°→水平。VQ1真値(2026-07-27)で確定した2点の修正が入っている:
+    #   (1) 機首上げは *負* の pitch 指令(旧コメントの「+側」は逆だった)
+    #   (2) 達成レート≈指令(bit16)なので 0.31rad を 0.3rad/s で回すには約1.03s
+    LEVEL = (1.03, 0.0, -0.3, 0.0, 0.281)
 
     def __init__(self, plan: str = "rate"):
         from .. import contracts as C
@@ -514,6 +551,74 @@ class ScriptedRatePilot:
                          (0.7, 0.0, 0.0, 0.0, h)]
             body += [(0.5, 0.0, 0.0, 0.0, 0.40), (0.55, 0.0, 0.0, 0.0, 0.12),
                      (0.7, 0.0, 0.0, 0.0, h)]
+            self.loop = body
+        elif plan == "fit":
+            # VQ1(真値テレメトリ有効)前提の全状態同定プラン。1本で rate/thrust/drag を網羅する。
+            # 回転は必ず ± 同幅のダブレットにするので姿勢が発散せず、長時間ループできる。
+            # 傾け指令の秒数は現行プラントゲイン(bit16=RATE_PLANT_GAIN_RADS / レガシー=
+            # RATE_CMD_GAIN)から逆算するため、解釈が切り替わっても同じ角度になる。
+            # ※既存プランの LEVEL(1.24s×0.1)はレガシー2.5倍ゲイン前提の秒数なので流用しない。
+            gp = RATE_PLANT_GAIN_RADS if USE_RAD_PER_SEC_BODY_RATES else RATE_CMD_GAIN
+
+            def _dur(angle_rad, rate, ax):
+                """指令rate[rad/s]でangle_rad回すのに要する秒数(プラントゲイン込み)。"""
+                return float(abs(angle_rad) / max(abs(rate * gp[ax]), 1e-6))
+
+            # 実測ホバー(MEASURED_HOVER)を基準にする: 旧 HOVER=0.2742 では A=1.149g で
+            # 際限なく上昇してしまう(VQ1真値で確認、2026-07-27)。
+            hf = MEASURED_HOVER
+            tilt_hf = hf * (1.0 / np.cos(np.radians(17.8))) ** (1.0 / 1.84)  # 17.8°傾斜で鉛直=g
+            th = float(np.radians(17.8))          # スポーン前傾角
+            t_lv = _dur(th, 0.3, 1)               # 17.8°を pitch=0.3rad/s で回す秒数
+            # ※符号: VQ1真値で「+pitch指令 → ATTITUDE pitch増 = 前傾が深くなる」と実測
+            #   (2026-07-27 runs/vq1_rate_0727)。既存コメントの「機首上げは+側」は逆だった。
+            level = (t_lv, 0.0, -0.3, 0.0, tilt_hf)     # 前傾→水平(機首上げ = -指令)
+            body = []
+            # (1) レートダブレット: 3軸 × 4振幅。± 同幅で姿勢がほぼ元へ戻る
+            for amp, dur in ((0.1, 0.5), (0.25, 0.4), (0.5, 0.3), (1.0, 0.2)):
+                for ax in range(3):
+                    rp = [0.0, 0.0, 0.0]
+                    rp[ax] = +amp
+                    rm = [0.0, 0.0, 0.0]
+                    rm[ax] = -amp
+                    body += [(dur, *rp, hf), (dur, *rm, hf), (0.45, 0.0, 0.0, 0.0, hf)]
+            # (2) 推力階段: 上げ/下げ対称ペアで高度を戻しつつ A(thrust) を掃く
+            for up, dn in ((0.28, 0.230), (0.31, 0.205), (0.34, 0.175), (0.38, 0.135),
+                           (0.24, 0.270)):
+                body += [(0.55, 0.0, 0.0, 0.0, up), (0.55, 0.0, 0.0, 0.0, dn),
+                         (0.6, 0.0, 0.0, 0.0, hf)]
+            # (3) 巡航→惰性: ドラッグが効く速度域を作る。真値の姿勢・速度が取れるので
+            #     「きれいに水平化できているか」に依存しない(IMU単独同定との決定的な差)。
+            #     roll方向にも振って横方向の速度を作る(body-y のドラッグ/符号確定用)。
+            body += [(t_lv, 0.0, +0.3, 0.0, tilt_hf),   # 前傾(機首下げ)
+                     (2.5, 0.0, 0.0, 0.0, tilt_hf),     # 前進加速
+                     level,                              # 水平化
+                     (3.0, 0.0, 0.0, 0.0, hf),           # 惰性減速(前後方向)
+                     (_dur(np.radians(20.0), 0.3, 0), +0.3, 0.0, 0.0, tilt_hf),  # バンク
+                     (2.5, 0.0, 0.0, 0.0, tilt_hf),      # 横方向へ加速(roll軸の符号確定用)
+                     (_dur(np.radians(20.0), 0.3, 0), -0.3, 0.0, 0.0, tilt_hf),  # 水平化
+                     (3.0, 0.0, 0.0, 0.0, hf),           # 惰性減速(横方向)
+                     # 高速域: ドラッグの2次項を分離するには 10m/s 級の速度が要る
+                     (_dur(np.radians(25.0), 0.4, 1), 0.0, +0.4, 0.0, tilt_hf),  # 25°前傾
+                     (5.0, 0.0, 0.0, 0.0, 0.285),        # 加速(→10m/s級)
+                     (_dur(np.radians(25.0), 0.4, 1), 0.0, -0.4, 0.0, tilt_hf),  # 水平化
+                     (4.0, 0.0, 0.0, 0.0, hf)]           # 高速からの惰性減速
+            self.prefix = [climb, level, (0.7, 0.0, 0.0, 0.0, hf)]
+            self.loop = body
+        elif plan == "sat":
+            # レート指令の飽和/線形性を方策の指令レンジ全域(action.rate_limits=±5rad/s)で確認する。
+            # ここが飽和していると、学習側で許した大舵が実機では出ず sim2sim が崩れる。
+            hf = MEASURED_HOVER
+            body = []
+            for amp, dur in ((0.5, 0.35), (1.0, 0.3), (2.0, 0.25), (3.0, 0.2),
+                             (4.0, 0.2), (5.0, 0.2)):
+                for ax in range(3):
+                    rp = [0.0, 0.0, 0.0]
+                    rp[ax] = +amp
+                    rm = [0.0, 0.0, 0.0]
+                    rm[ax] = -amp
+                    body += [(dur, *rp, hf), (dur, *rm, hf), (0.8, 0.0, 0.0, 0.0, hf)]
+            self.prefix = [climb, (1.03, 0.0, -0.3, 0.0, 0.281), (0.7, 0.0, 0.0, 0.0, hf)]
             self.loop = body
         elif plan == "drag":
             # スポーンの前傾-17.8°をそのまま加速に使う(prefixで水平化しない)
@@ -759,7 +864,8 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         yolox_ckpt: str = DEFAULT_YOLOX_CKPT,
         record_dir: str | None = None, sysid: bool = False,
         sysid_plan: str = "rate", stochastic: bool = False,
-        gate_area_max: float | None = None) -> None:
+        gate_area_max: float | None = None,
+        video_on: bool = True, tx_hz: float = CONTROL_HZ) -> None:
     import collections
     import signal
 
@@ -780,16 +886,20 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
         print("SYSID mode: 方策なし・既知コマンド列を送出します", flush=True)
     else:
         pilot = GenesisPilot(ckpt, stochastic=stochastic)  # 重いロードを接続前に済ませる(後始末不要フェーズ)
-    gate_fn = make_gate_detector(gate_detector, yolox_ckpt, gate_area_max)  # YOLOX/HSV も接続前にロード
+    # 映像なし(--no-video)は動力学同定用: YOLOX/JPEGデコードを一切動かさず、
+    # 送信ジッタとUDP取りこぼしを最小化する(観測は使わないので方策飛行では使わない)。
+    gate_fn = make_gate_detector(gate_detector, yolox_ckpt, gate_area_max) if video_on else None
     recorder = None
     if record_dir:
         from .recorder import FlightRecorder
         recorder = FlightRecorder(record_dir, meta={
             "ckpt": ckpt, "contract_hash": C.contract_hash(),
-            "gate_detector": gate_detector, "policy_hz": C.POLICY_HZ,
+            "gate_detector": gate_detector if video_on else None, "policy_hz": C.POLICY_HZ,
             "sysid": sysid, "sysid_plan": sysid_plan if sysid else None,
-            "stochastic": stochastic})
+            "stochastic": stochastic, "tx_hz": tx_hz, "video": video_on})
         shared["imu_log"] = collections.deque(maxlen=200_000)  # rxスレッドが積む
+        # 真値テレメトリ(VQ1のみ)。VQ2では空のまま=truth.jsonlも作られない。
+        shared["truth_log"] = collections.deque(maxlen=2_000_000)
     relay_proc = None
     mav = None
     video = None
@@ -816,7 +926,8 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
     try:
         relay_proc = spawn_win_relay(mavlink_port, video_port) if relay else None
         mav = MavlinkIO(shared, mavlink_ip, mavlink_port)   # ハートビート待ちでブロックし得る
-        video = VideoRX(shared, port=video_port, out_mp4=out_mp4, gate_detect_fn=gate_fn)
+        video = (VideoRX(shared, port=video_port, out_mp4=out_mp4, gate_detect_fn=gate_fn)
+                 if video_on else None)
 
         print("Arming drone...", flush=True)
         mav.arm()
@@ -864,9 +975,22 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
             # 1.5秒以内の衝突は比力スパイク判定をすり抜け、床に転がったまま止まる)→ リセット
             imu_now = shared.get("imu") or {}
             gy = imu_now.get("gyro", (0.0, 0.0, 0.0))
-            if not flying or (gy[0] ** 2 + gy[1] ** 2 + gy[2] ** 2) ** 0.5 > 0.03:
+            tpos = (shared.get("truth") or {}).get("POS")
+            if tpos is not None:
+                # VQ1: 真の速度で判定する。gyro判定だと「レート0を数秒保持する同定プラン」を
+                # 墜落と誤判定してリセットしてしまう(飛行が28秒で切れる原因だった)。
+                vv = tpos["v"][3:6]
+                moving = (vv[0] ** 2 + vv[1] ** 2 + vv[2] ** 2) ** 0.5 > 0.25
+            else:
+                moving = (gy[0] ** 2 + gy[1] ** 2 + gy[2] ** 2) ** 0.5 > 0.03
+            # テレメトリ無し(VQ2)の同定走行では「レート0を長く保持する」のが正常
+            # (推力階段は8.5秒連続でrates=0)。gyroだけでは墜落と区別できないので
+            # このウォッチドッグは無効化する(衝突は比力スパイクで検知できる)。
+            motion_watchdog = tpos is not None or not sysid
+            motion_timeout = 3.0
+            if not flying or moving or not motion_watchdog:
                 last_motion_t = now
-            elif now - last_motion_t > 3.0:
+            elif now - last_motion_t > motion_timeout:
                 print("WATCHDOG: flying but motionless 3s (crashed in grace?) -> reset & re-arm",
                       flush=True)
                 if recorder is not None:
@@ -890,14 +1014,19 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
             if not flying:
                 cmd = (0.0, 0.0, 0.0, START_THRUST)  # ピン中/待機はスタート推力(0.265)でピン解除
 
-            if now >= next_tx_t:                     # 250Hzで送信
-                next_tx_t = max(next_tx_t + 1.0 / CONTROL_HZ, now)
+            if now >= next_tx_t:                     # 既定250Hzで送信(--tx-hzで変更可)
+                next_tx_t = max(next_tx_t + 1.0 / tx_hz, now)
                 mav.send_rates(*cmd)
 
-            if recorder is not None:                 # 高レートIMUを逐次書き出し
+            if recorder is not None:                 # 高レートIMU/真値を逐次書き出し
                 q = shared.get("imu_log")
                 while q:
                     recorder.record_imu(q.popleft())
+                q = shared.get("truth_log")
+                while q:
+                    recorder.record_truth(q.popleft())
+                if shared.get("track"):       # VQ1のみ: 実ゲート幾何を1回だけ保存
+                    recorder.record_track(shared["track"])
 
             col = shared.get("collision")
             if col and not col.get("handled"):
@@ -916,11 +1045,20 @@ def run(ckpt: str, mavlink_ip="0.0.0.0", mavlink_port=14550,
             if now - last_status_t > 5.0:
                 last_status_t = now
                 og = shared.get("obs_gate") or {}
+                vid = (f"proc={video.frames}/{video.rx_frames} lag={video.lag_s * 1000:.0f}ms "
+                       if video is not None else "video=off ")
+                tr = shared.get("truth") or {}
+                if tr:   # VQ1: 真値テレメトリの到達状況と現在値(NED)
+                    att = tr.get("ATT", {}).get("v", (0,) * 6)
+                    pos = tr.get("POS", {}).get("v", (0,) * 6)
+                    vid += (f"| truth[{'/'.join(sorted(tr))}] "
+                            f"rpy=({att[0]:+.2f},{att[1]:+.2f},{att[2]:+.2f}) "
+                            f"ned=({pos[0]:+.1f},{pos[1]:+.1f},{pos[2]:+.1f}) "
+                            f"|v|={(pos[3]**2 + pos[4]**2 + pos[5]**2) ** 0.5:4.1f} ")
                 print(f"[dcl] t={now - t_start:6.1f}s pin={int(flying)} "
                       f"gate={race.get('active_gate_index', '-')} "
                       f"det={int(og.get('visible', 0))} rel={og.get('rel_dist', 1.0):.2f} "
-                      f"proc={video.frames}/{video.rx_frames} lag={video.lag_s * 1000:.0f}ms "
-                      f"thr={cmd[3]:.3f}", flush=True)
+                      f"{vid}thr={cmd[3]:.3f}", flush=True)
 
             if max_sec and now - t_start > max_sec:
                 print(f"Time limit ({max_sec:.0f}s); stopping.", flush=True)

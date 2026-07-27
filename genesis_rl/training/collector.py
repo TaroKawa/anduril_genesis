@@ -142,8 +142,12 @@ class Collector:
 
     def policy_action(self, deterministic: bool = False) -> torch.Tensor:
         if self.transitions < self.cfg.sac.burn_in_steps and not deterministic:
-            # ホバーバイアス付きランダム(a3=0 → thrust 0.2694 = ホバー)
-            return (torch.randn(self.N, C.ACTION_DIM, device=self.env.device) * 0.3).clamp(-1, 1)
+            # ホバーバイアス付きランダム。thrust帯 [0,0.35] では a3=0 は A≈0.5g(落下)なので、
+            # ホバーに対応する a3(=C.HOVER_ACTION3)を中心にする。ここを0のままにすると
+            # burn-in の全エピソードが即墜落して初期バッファが使えない。
+            a = (torch.randn(self.N, C.ACTION_DIM, device=self.env.device) * 0.3)
+            a[:, 3] += C.HOVER_ACTION3
+            return a.clamp(-1, 1)
         with torch.no_grad():
             return self.actor.act(self._feat_hist, self._vec_hist, deterministic=deterministic)
 

@@ -47,6 +47,10 @@ class DroneModel:
         self.inertia = torch.tensor(c.inertia, device=device).expand(num_envs, 3).clone()
         self.cmd_gain = torch.tensor(getattr(c, "cmd_gain", (1.0, 1.0, 1.0)),
                                      device=device).view(1, 3)
+        # k_rate はスカラでも3軸タプルでも受ける(実シムは軸ごとに時定数が違う)
+        k = getattr(c, "k_rate", 35.0)
+        k = (float(k),) * 3 if isinstance(k, (int, float)) else tuple(float(x) for x in k)
+        self.k_rate = torch.tensor(k, device=device).view(1, 3)
         # エピソードごとのDR倍率
         self.mass_mul = torch.ones(num_envs, 1, device=device)
         self.k_rate_mul = torch.ones(num_envs, 1, device=device)
@@ -114,9 +118,11 @@ class DroneModel:
         c = self.cfg
         m = c.mass * self.mass_mul
 
-        # 実シムのプラントゲイン模擬: 達成レート目標 = cmd_gain * 指令
-        rate_cmd = cmd[:, :3] * self.cmd_gain * self.cmd_gain_mul
-        omega_sp_frd = self.signs.command_to_frd(rate_cmd).clamp(-c.rate_max, c.rate_max)
+        # 実シムのプラントゲイン模擬: 達成レート目標 = cmd_gain * clamp(指令, ±rate_max)
+        # 実シムは *指令* を約2.6rad/sでクリップしてからプラントゲインを掛ける
+        # (VQ1真値の振幅掃引 2026-07-27: 指令5rad/sでもroll達成2.5・yaw2.36で頭打ち)。
+        rate_cmd = cmd[:, :3].clamp(-c.rate_max, c.rate_max) * self.cmd_gain * self.cmd_gain_mul
+        omega_sp_frd = self.signs.command_to_frd(rate_cmd)
         thrust = cmd[:, 3:4].clamp(0.0, 1.0)
 
         # 推力(比力モデル): A = g * (t/hover)^alpha、body上向き(FLU +z)
@@ -125,30 +131,37 @@ class DroneModel:
         A = G * (thrust / hover).pow(alpha)
         f_thrust_local = torch.cat([torch.zeros_like(A), torch.zeros_like(A), m * A], dim=1)
 
-        # ドラッグ(world系)
-        f_drag_world = -m * c.drag_c * self.drag_mul * state["vel_w"]
+        # ドラッグ: body軸別の 線形+2次(VQ1真値同定 2026-07-27。ほぼ純2次で、
+        # 水平 c2≈0.043 に対し鉛直 c2≈0.019 と半分以下=異方)。
+        v_frd = quat_rotate_inv(state["quat_ned"], state["vel_ned"])
+        sp = state["vel_ned"].norm(dim=1, keepdim=True)
+        c2 = getattr(c, "drag_c2", 0.0) or 0.0
+        cz = getattr(c, "drag_cz", None)
+        c2z = getattr(c, "drag_c2z", None)
+        kh = (c.drag_c + c2 * sp) * self.drag_mul
+        kv = ((c.drag_c if cz is None else cz)
+              + (c2 if c2z is None else c2z) * sp) * self.drag_mul
+        a_drag_frd = -torch.cat([kh * v_frd[:, :2], kv * v_frd[:, 2:3]], dim=1)
+        f_drag_local = frd_to_flu(m * a_drag_frd)
 
         # レート追従トルク(body FRD → FLU、localで印加)
         omega_frd = state["omega_frd"]
         I = self.inertia * self.inertia_mul
-        alpha_sp = c.k_rate * self.k_rate_mul * (omega_sp_frd - omega_frd)
+        alpha_sp = self.k_rate * self.k_rate_mul * (omega_sp_frd - omega_frd)
         tau_frd = I * alpha_sp
         tau_max = I * 40.0
         tau_frd = tau_frd.clamp(-tau_max, tau_max)
         tau_local = frd_to_flu(tau_frd)
 
         self.solver.apply_links_external_force(
-            f_thrust_local, links_idx=[self.base_link_idx], ref="link_com", local=True)
-        self.solver.apply_links_external_force(
-            f_drag_world, links_idx=[self.base_link_idx], ref="link_com", local=False)
+            f_thrust_local + f_drag_local, links_idx=[self.base_link_idx],
+            ref="link_com", local=True)
         self.solver.apply_links_external_torque(
             tau_local, links_idx=[self.base_link_idx], ref="link_com", local=True)
 
-        # IMU用の解析比力(重力を除く印加加速度をbodyへ): f_b = R^T (F_thrust + F_drag)/m
-        # 推力はbody FLU +z = FRD -z
-        f_frd = torch.cat([torch.zeros_like(A), torch.zeros_like(A), -A], dim=1)
-        drag_ned = world_to_ned(f_drag_world) / m
-        f_frd = f_frd + quat_rotate_inv(state["quat_ned"], drag_ned)
+        # IMU用の解析比力(重力を除く印加加速度をbodyへ): f_b = (F_thrust + F_drag)/m
+        # 推力はbody FLU +z = FRD -z。ドラッグは既にFRDで計算済み。
+        f_frd = torch.cat([torch.zeros_like(A), torch.zeros_like(A), -A], dim=1) + a_drag_frd
         self.last_specific_force_frd = f_frd
 
     # --- リセット ---

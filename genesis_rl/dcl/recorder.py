@@ -118,6 +118,35 @@ class FlightRecorder:
             self._fev = open(os.path.join(self.dir, "events.jsonl"), "w", buffering=1)
         self._fev.write(json.dumps(ev) + "\n")
 
+    def record_track(self, track: dict):
+        """トラック情報(実ゲートのNED位置/向き/寸法)を track.json へ1回だけ保存。
+
+        VQ1でのみ受信できる。自作シムのコース再現(course.py)の実測ソースになる。
+        """
+        if getattr(self, "_track_saved", False):
+            return
+        self._track_saved = True
+        with open(os.path.join(self.dir, "track.json"), "w", encoding="utf-8") as f:
+            json.dump(track, f, indent=2, default=str)
+        print(f"[recorder] track.json: {track.get('num_gates')}ゲートを保存", flush=True)
+
+    def record_truth(self, sample: dict):
+        """真値テレメトリ1サンプルを truth.jsonl へ(VQ1レガシービルドのみ流れてくる)。
+
+        {t_rx_wall, kind, t_sim, v[...]}。kind=ATT/POS/ODOM/ACT(MavlinkIO._on_truth参照)。
+        型ごとに時刻源が違うので融合せず生の列で残す(整列は analyze_truth.py)。
+        ファイルは最初のサンプルが来たときだけ作る(VQ2では作られない=テレメトリ無しの証跡)。
+        """
+        if not hasattr(self, "_ftruth"):
+            self._ftruth = open(os.path.join(self.dir, "truth.jsonl"), "w", buffering=1)
+        self._ftruth.write(json.dumps({
+            "t_rx_wall": float(sample["t_rx_wall"]),
+            "kind": sample["kind"],
+            "t_sim": float(sample["t_sim"]),
+            "v": _to_list(sample["v"]),
+        }) + "\n")
+        self.truth_samples = getattr(self, "truth_samples", 0) + 1
+
     def record_imu(self, sample: dict):
         """HIGHRES_IMU 1サンプルを imu.jsonl へ。
         {t_rx_wall, t_sim, gyro[3], accel[3]}(生値・符号は本番規約のまま)。"""
@@ -130,11 +159,13 @@ class FlightRecorder:
         self.imu_samples += 1
 
     def close(self):
-        for f in (self._f, self._fimu, getattr(self, "_fev", None)):
+        for f in (self._f, self._fimu, getattr(self, "_fev", None),
+                  getattr(self, "_ftruth", None)):
             try:
                 if f is not None:
                     f.close()
             except Exception:
                 pass
-        print(f"[recorder] wrote {self.step} steps / {self.imu_samples} imu samples "
-              f"to {self.dir}/", flush=True)
+        n_truth = getattr(self, "truth_samples", 0)
+        print(f"[recorder] wrote {self.step} steps / {self.imu_samples} imu samples / "
+              f"{n_truth} truth samples to {self.dir}/", flush=True)

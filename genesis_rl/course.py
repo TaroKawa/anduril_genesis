@@ -344,6 +344,81 @@ class CourseGenerator:
 RIBBON_SAMPLES_PER_SEG = 40
 
 
+def course_from_track(track_path: str, spawn_ned=(0.0, 0.0, 0.0),
+                      hall_margin: float = 8.0) -> CourseSpec:
+    """VQ1テレメトリの track.json(実ゲート幾何)から CourseSpec を作る。
+
+    生成コースではなく *実測コースそのまま* で学習/評価したいときに使う。
+    fly_dcl --record-dir DIR で録ると DIR/track.json に保存される(VQ1のみ)。
+
+    DCLのゲート姿勢は「ゲート面の法線 = ゲートローカル +y」で来る(2026-07-27 実測:
+    全ゲート quat=(0.7071,0,0,0.7071)=yaw90° → 法線 = -N = コース進行方向)。
+    こちらの GateSpec.yaw は法線の方位なので、法線ベクトルから直接求める。
+
+    gates[0] はスタートゲート扱い(機体がその中でスポーンする)という当リポの規約に
+    合わせ、スポーン地点に合成スタートゲートを1枚足してから実ゲートを並べる。
+    実測(2026-07-27)ではスポーンは NED 原点、最初の実ゲートは 23m 先だった。
+    """
+    import json
+
+    with open(track_path, encoding="utf-8") as f:
+        tr = json.load(f)
+    gates_raw = tr["gates"]
+    centers = [np.asarray(spawn_ned, float)]
+    specs = []
+    for g in gates_raw:
+        centers.append(np.array(g["pos_ned"], float))
+
+    def _yaw_pitch(quat) -> tuple[float, float]:
+        w, x, y, z = [float(v) for v in quat]
+        # ゲートローカル +y をNEDへ = 回転行列の2列目
+        n = np.array([2 * (x * y - w * z),
+                      1 - 2 * (x * x + z * z),
+                      2 * (y * z + w * x)])
+        n = n / max(np.linalg.norm(n), 1e-9)
+        return float(np.arctan2(n[1], n[0])), float(-np.arcsin(np.clip(n[2], -1, 1)))
+
+    # スタートゲート: 最初の実ゲートを向く
+    d0 = centers[1] - centers[0]
+    specs.append(GateSpec(center_ned=centers[0],
+                          yaw=float(np.arctan2(d0[1], d0[0])), pitch=0.0, roll=0.0))
+    for g, c in zip(gates_raw, centers[1:]):
+        yaw, pitch = _yaw_pitch(g["quat_ned"])
+        specs.append(GateSpec(center_ned=c, yaw=yaw, pitch=pitch, roll=0.0))
+
+    pts = np.array(centers)
+    ribbon = _catmull_rom(pts, samples_per_seg=RIBBON_SAMPLES_PER_SEG)
+    span_n = float(pts[:, 0].max() - pts[:, 0].min())
+    span_e = float(pts[:, 1].max() - pts[:, 1].min())
+    span_d = float(pts[:, 2].max() - pts[:, 2].min())
+    hall = HallSpec(length=span_n + 2 * hall_margin, width=span_e + 2 * hall_margin,
+                    height=span_d + 2 * hall_margin, margin=hall_margin)
+    spec = CourseSpec(gates=specs, ribbon_pts=ribbon, pillars=np.zeros((0, 2)),
+                      hall=hall, seed=-1)
+    CourseGenerator._compute_arc(spec)
+    return spec
+
+
+def describe_track(track_path: str) -> str:
+    """track.json の要約(ゲート間隔・高低差・寸法)。学習コースの現実性チェック用。"""
+    spec = course_from_track(track_path)
+    c = np.array([g.center_ned for g in spec.gates])
+    seg = np.linalg.norm(np.diff(c, axis=0), axis=1)
+    import json
+    with open(track_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    w = [g["width"] for g in raw["gates"]]
+    h = [g["height"] for g in raw["gates"]]
+    return (f"実ゲート {raw['num_gates']}枚(+合成スタート)  "
+            f"間隔 {seg.min():.1f}〜{seg.max():.1f}m(中央 {np.median(seg):.1f})  "
+            f"全長 {spec.total_arc:.0f}m\n"
+            f"  寸法 width {min(w):.2f}〜{max(w):.2f} / height {min(h):.2f}〜{max(h):.2f} m\n"
+            f"  高度(NED d) {c[:, 2].min():+.1f}〜{c[:, 2].max():+.1f} m  "
+            f"横方向 {c[:, 1].min():+.1f}〜{c[:, 1].max():+.1f} m\n"
+            f"  ゲート面 yaw {np.degrees([g.yaw for g in spec.gates]).round(1).tolist()}\n"
+            f"  ゲート面 pitch {np.degrees([g.pitch for g in spec.gates]).round(1).tolist()}")
+
+
 def ribbon_segments(spec: CourseSpec, width: float = 1.8) -> list[tuple[np.ndarray, np.ndarray]]:
     """ゲートiへ向かうリボン区間(ゲートi-1→i)のメッシュを個別に返す(i=1..n_gates-1)。
 

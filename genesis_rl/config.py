@@ -59,11 +59,19 @@ class DroneConfig:
 
     mass: float = uc("dynamics", "mass", 0.9)
     inertia: tuple = uc("dynamics", "inertia", (0.0065, 0.0065, 0.011))
-    k_rate: float = uc("dynamics", "k_rate", 35.0)          # レート追従P [1/s]
+    # レート追従P [1/s]。軸別(VQ1真値の実測ではroll/pitch τ≈16ms、yaw τ≈29ms)。
+    # dataclassのdefaultにlistは置けないので、既定をtupleにして uc() に list→tuple 変換させる。
+    k_rate: tuple = uc("dynamics", "k_rate", (35.0, 35.0, 35.0))
     cmd_gain: tuple = uc("dynamics", "cmd_gain", (1.0, 1.0, 0.89))  # 達成レート=cmd_gain×指令
     hover_thrust: float = uc("dynamics", "hover_thrust", 0.2694)   # A = g*(t/hover)^alpha
     thrust_alpha: float = uc("dynamics", "thrust_alpha", 1.84)
-    drag_c: float = uc("dynamics", "drag_c", 0.64)          # 線形ドラッグ
+    # ドラッグ: body水平(x,y)と鉛直(z)で係数が違う(VQ1真値で異方性を確認)。
+    #   線形 [1/s] + 2次 [1/m]: a_drag = -(c + c2|v|)·v_body(軸ごとに係数)
+    # 実シムはほぼ純2次(速度4.5m/sで実効0.18、10.7m/sで0.44 → 同じ c2≈0.043 で説明)。
+    drag_c: float = uc("dynamics", "drag_c", 0.64)          # 水平・線形
+    drag_c2: float = uc("dynamics", "drag_c2", 0.0)         # 水平・2次
+    drag_cz: float = uc("dynamics", "drag_cz", None)        # 鉛直・線形(Noneで水平と同じ)
+    drag_c2z: float = uc("dynamics", "drag_c2z", None)      # 鉛直・2次(Noneで水平と同じ)
     rate_max: float = uc("dynamics", "rate_max", 4.0)       # 内部レート目標クランプ [rad/s]
     # DR倍率レンジ(エピソードごと)。config.yaml: domain_rand
     dr_mass: tuple = uc("domain_rand", "mass", (0.9, 1.1))

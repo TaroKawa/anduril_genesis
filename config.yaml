@@ -11,15 +11,22 @@
 
 # --- アクションマッピング(方策 a∈[-1,1]^4 → 物理指令)。contracts.py ---
 action:
-  rate_limits:    [5.0, 5.0, 5.0]   # roll/pitch/yaw の指令レート上限 [rad/s](a=±1で±これ)
-  thrust_center:  0.2694            # a3=0 の推力(=ホバー)
-  thrust_halfspan: 0.0306           # → thrust ∈ [0.2388, 0.30]。下端=下降、上端=上昇
-  hover_thrust:   0.2742            # A==g 参考値(フェイルセーフ/逆写像用)
+  # 方策の行動レンジ(ユーザー指定 2026-07-28): レート ±1 rad/s、推力 0〜0.35。
+  # 参考(実シムの物理上限、VQ1真値の振幅掃引 2026-07-27): 指令レートは約2.6rad/sで
+  # クリップされ、5rad/sを送っても達成は roll 2.50 / yaw 2.36 rad/s で頭打ち。
+  # ±1 はその内側なので飽和には当たらない(dynamics.rate_max=2.65 のクランプも効かない)。
+  rate_limits:    [1.0, 1.0, 1.0]   # roll/pitch/yaw の指令レート上限 [rad/s](a=±1で±これ)
+  # thrust ∈ [0, 0.35] = center ± halfspan。**a3=0 はホバーではない**点に注意:
+  # A==g は thrust=0.2665(VQ1実測)なので、ホバーに対応する行動は a3=+0.523。
+  # 推力0(自由落下)〜0.35(A=1.55g)まで使える広い帯で、上下の権限は旧設定(±0.0306)より大きい。
+  thrust_center:  0.175             # a3=0 の推力(=レンジ中央。ホバーではない)
+  thrust_halfspan: 0.175            # → thrust ∈ [0.0, 0.35]
+  hover_thrust:   0.2665            # A==g 実測値(フェイルセーフ/逆写像/burn-inバイアス用)
   takeoff_thrust: 0.265             # 離陸/ピン解除の閾値(スタート出力。deploy START_THRUST)
 
 # --- 観測スケール & ゲート検出。contracts.py ---
 observation:
-  rate_scale:        6.0            # gyro 正規化 [rad/s](rate_limits ±5 / rate_max 6 に整合)
+  rate_scale:        3.0            # gyro 正規化 [rad/s](達成レート上限 2.5 に整合)
   accel_scale:       25.0           # accel 正規化 [m/s^2]
   v_scale:           15.0           # 特権 velocity [m/s]
   pos_scale:         60.0           # 特権 position [m]
@@ -43,16 +50,31 @@ timing:
   phys_hz: 120
   decimation: 4                     # 1決定=4物理ステップ → 30Hz
 
-# --- 動力学(DCL実機 open-loop sysid で較正)。config.py DroneConfig ---
+# --- 動力学 ---
+# 2026-07-27: VQ1レガシー(テレメトリ有効)シムの *真値* テレメトリで再同定した。
+# 3run/有効308秒/|v| 0〜11.8m/s/thrust 0.135〜0.38 を1つのベクトル最小二乗にかけた結果
+# (scripts/analyze_truth.py。検証: 真値運動学から求めた比力と HIGHRES_IMU accel が
+#  x/y 差rms 0.01・z 0.17 m/s² で一致 = 座標系と時刻整合が正しいことの証明)。
+# 旧値はIMU単独同定(2026-07-23)で、速度を加速度の積分で作っていたため
+# ドラッグを線形と誤認し(0.64)、推力の指数も過大(1.84)だった。
 dynamics:
   mass:         0.9
   inertia:      [0.0065, 0.0065, 0.011]
-  k_rate:       35.0                # レート追従P [1/s]
-  cmd_gain:     [1.0, 1.0, 0.89]    # bit16実測: 達成レート=cmd_gain×指令(roll/pitch~1.0, yaw0.89)
-  hover_thrust: 0.2694              # A = g*(t/0.2694)^1.84
-  thrust_alpha: 1.84
-  drag_c:       0.64                # 線形ドラッグ
-  rate_max:     6.0                 # 内部レート目標クランプ [rad/s](rate_limits ±5 を切らないよう余裕)
+  # 軸別レート追従P [1/s]。roll/pitch は τ≈16ms、yaw だけ τ≈29ms と遅い(実測)
+  k_rate:       [61.0, 64.0, 35.0]
+  # |達成レート/指令| の定常値(過渡0.15s除外の実測)。符号は signs.cmd 側で持つ
+  cmd_gain:     [0.95, 0.96, 0.86]
+  hover_thrust: 0.2665              # A = g*(t/0.2665)^1.66(多項式より残差が同等以下)
+  thrust_alpha: 1.66
+  # ドラッグはほぼ *純2次*: 線形項のみだと残差0.564、2次のみで0.435 m/s²。
+  # (旧線形0.64は「4.5m/sで実効0.18、10.7m/sで0.44」を1本の線形で無理に説明していた)
+  # body軸別(水平 xy / 鉛直 z)。等方だと残差0.435、軸別で0.385 m/s²
+  drag_c:       0.0                 # 水平・線形 [1/s]
+  drag_c2:      0.0427              # 水平・2次 [1/m] → a = -(c + c2|v|)·v_body
+  drag_cz:      0.043               # 鉛直・線形 [1/s]
+  drag_c2z:     0.0186              # 鉛直・2次 [1/m](水平の半分以下)
+  # *指令* のクランプ [rad/s]。実シムの飽和(約2.6rad/s)を再現する。この後に cmd_gain が掛かる
+  rate_max:     2.65
 
 # --- ドメインランダム化(エピソード毎の倍率レンジ)。config.py DroneConfig ---
 domain_rand:
@@ -64,15 +86,24 @@ domain_rand:
   thrust_alpha: [0.95, 1.05]
   inertia:      [0.7, 1.3]
 
-# --- 指令/観測の符号(左手系挙動の再現。bit16でsigns_cmdを再導出)。config.py EnvConfig ---
+# --- 指令/観測の符号。config.py EnvConfig ---
+# 2026-07-27 VQ1真値で確定。基準は「ODOMETRYクォータニオンをy軸鏡像で直した標準FRD」
+# (DCLは姿勢を左手系で配信している。analyze_truth.ODOM_QUAT_YMIRROR 参照)。
+#   指令 → 標準FRD角速度   = (-0.86, -0.88, -0.77) → 符号は全軸 -1
+#   標準FRD角速度 → 生gyro = (-0.90, -0.99, -0.89) → 符号は全軸 -1
+#   accel は標準FRD比力そのまま(差rms 0.01 m/s²)
+# 旧値は yaw の指令符号と roll/pitch の観測符号が逆で、学習↔実機で yaw の回る向きが
+# 反転していた(見た目の対応が壊れる=方策が逆に舵を切る)。
 signs:
-  cmd:   [-1.0, -1.0, 1.0]          # 指令→内部FRDレート目標の符号
-  gyro:  [1.0, 1.0, -1.0]           # 内部FRD角速度→観測gyroの符号
+  cmd:   [-1.0, -1.0, -1.0]         # 指令→内部FRDレート目標の符号
+  gyro:  [-1.0, -1.0, -1.0]         # 内部FRD角速度→観測gyro(=生HIGHRES_IMU)の符号
   accel: [1.0, 1.0, 1.0]
 
 # --- センサ(IMU/検出ノイズ・遅延)。config.py SensorConfig + sensors/imu.py ---
 sensor:
-  imu_decimation:    2              # 120Hz/2=60Hz(実機~56Hz整合)
+  # 実機HIGHRES_IMUは飛行中 ~100Hz(VQ1実測 2026-07-27。旧「~56Hz」は受信取りこぼし
+  # を含む古い計測だった) → 120Hz物理の等倍が最も近い
+  imu_decimation:    1              # 120Hz/1=120Hz(実機~100Hzに整合)
   accel_sigma:       0.4
   accel_bias_init:   0.2
   accel_bias_walk:   0.01
@@ -98,7 +129,8 @@ sensor:
   det_delay_jitter:  1
   img_delay_frames:  2
   img_delay_jitter:  1
-  act_delay_steps:   0
+  # 指令→角速度応答の遅延は実測 5〜10ms(VQ1真値、軸別[5,5,10]) = 120Hz物理で約1ステップ
+  act_delay_steps:   1
   act_delay_jitter:  1
 
 # --- スポーン/衝突(学習環境)。config.py EnvConfig ---
@@ -110,9 +142,11 @@ env_physics:
 
 # --- 本番シム推論(デプロイ)。dcl/client.py ---
 deploy:
-  use_rad_per_sec_body_rates: true  # bit16(rev3390 rad/s)。旧ckptを飛ばす時のみ false
-  rate_plant_gain_rads: [1.0, 1.0, 0.89]  # bit16時の実機レート・プラントゲイン(送信スケール分母)
+  use_rad_per_sec_body_rates: true  # bit16(rev3390 rad/s)。VQ1レガシービルドでも有効と実測
+  # VQ1真値の実測プラントゲイン。dynamics.cmd_gain と同値にしてあるので送信スケールは1になる
+  rate_plant_gain_rads: [0.95, 0.96, 0.86]
   rate_cmd_gain:        [2.44, 2.46, 2.18]  # レガシー(bit16 off)時のプラントゲイン
+  measured_hover:       0.2665      # A==g の実測推力(同定プラン ScriptedRatePilot が基準に使う)
   # rel_dist = 1 - bbox面積/これ。学習側 SimGateDetector は s_px=FX·2.7/d の幾何投影を
   # 契約値150000で割る。YOLOX-xの実bbox面積を既知距離のレンダで実測したところ幾何投影の
   # 1.10倍(2/5/8m×9ゲート、2026-07-26)で、旧値25000は6倍過小 → 同じ距離でrel_distが
@@ -120,6 +154,9 @@ deploy:
   # Genesis学習時は平均0.82・p10=0.50)。方策は「もうゲート直前」と誤認し続けていた。
   real_gate_area_max:   150000.0    # = contracts.GATE_AREA_MAX(契約どおり)
   start_thrust:         0.265       # ピン解除前に出す推力(= takeoff_thrust)
-  gyro_obs_sign:        [-1.0, -1.0, -1.0]  # 生HIGHRES_IMU gyro→観測 の符号
+  # 生HIGHRES_IMU gyro は「内部標準FRD角速度の符号反転」そのもの(VQ1真値で確定)。
+  # 学習側 signs.gyro=[-1,-1,-1] が同じ変換をするので、デプロイは生値をそのまま渡せばよい。
+  # (旧: 学習[1,1,-1]×デプロイ[-1,-1,-1] で yaw の観測符号が学習と実機で反転していた)
+  gyro_obs_sign:        [1.0, 1.0, 1.0]
   accel_obs_sign:       [1.0, 1.0, 1.0]
   collision_accel_mps2: 40.0        # |accel|>これ で衝突検知(発進1.5sグレース後)

@@ -47,17 +47,26 @@ def main():
     ap.add_argument("--sysid", action="store_true",
                     help="方策を外し、既知のコマンド列を送って開ループでプラント動力学を"
                          "同定する(--record-dir と併用。--no-reset-on-collision推奨)")
-    ap.add_argument("--sysid-plan", choices=["rate", "roll", "yaw", "thrust", "drag"], default="rate",
+    ap.add_argument("--sysid-plan",
+                    choices=["rate", "roll", "yaw", "thrust", "drag", "fit", "sat"],
+                    default="rate",
                     help="同定プラン: rate=レートゲイン線形性/時定数/遅延, yaw=yaw不感帯掃引, "
-                         "thrust=比力曲線A(thrust), drag=線形ドラッグc(解析はanalyze_sysid)")
+                         "thrust=比力曲線A(thrust), drag=線形ドラッグc(解析はanalyze_sysid), "
+                         "fit=全状態同定用の1本完結プラン(VQ1真値前提。解析はanalyze_truth)")
+    ap.add_argument("--no-video", action="store_true",
+                    help="映像UDP受信とゲート検出を動かさない(動力学同定時に推奨: "
+                         "YOLOX/JPEGデコードのCPU負荷と送信ジッタを排除)")
+    ap.add_argument("--tx-hz", type=float, default=0.0,
+                    help="コマンド送信レート[Hz]。0で既定(250)。仕様上限<100の検証用に90等を指定")
     ap.add_argument("--gate-area-max", type=float, default=0.0,
                     help="rel_dist=1-bbox面積/この値。0で契約既定150000。実bboxはGenesis投影より"
                          "小さくrel_distが遠側に張り付くため、下げる(例25000)と接近で早く下がる")
     args = ap.parse_args()
 
-    from ..dcl.client import run
+    from ..dcl.client import CONTROL_HZ, run
 
     run(ckpt=args.ckpt, mavlink_ip=args.mavlink_ip, mavlink_port=args.mavlink_port,
+        video_on=not args.no_video, tx_hz=(args.tx_hz or CONTROL_HZ),
         video_port=args.video_port, out_mp4=args.out or None, max_sec=args.max_sec,
         reset_on_collision=not args.no_reset_on_collision, relay=not args.no_relay,
         gate_detector=args.gate_detector, yolox_ckpt=args.yolox_ckpt,
