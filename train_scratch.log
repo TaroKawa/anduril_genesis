@@ -136,3 +136,113 @@ A copy of this license is made available in this container at /NGC-DL-CONTAINER-
 [learner] resumed from checkpoints/latest.pt (updates=0)
 
 [run] 中断 (exit 130)
+ Container anduril_genesis-train-run-1c7cea193ad4 Creating 
+ Container anduril_genesis-train-run-1c7cea193ad4 Created 
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[orchestrator] learner=GPU0  collectors=7本 → GPU割当 [1, 2, 3, 4, 5, 6, 7]
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+[learner] collector0 up: stage=0 seed=0 envs=384 backend=batch
+[learner] collector2 up: stage=0 seed=0 envs=384 backend=batch
+[learner] collector4 up: stage=0 seed=0 envs=384 backend=batch
+[learner] collector1 up: stage=0 seed=0 envs=384 backend=batch
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/root/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/app/.venv/lib/python3.12/site-packages/quadrants/lang/ast/ast_transformers/function_def_transformer.py:671: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  return index == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str))
+W0727 18:25:13.596000 138 .venv/lib/python3.12/site-packages/torch/_logging/_internal.py:1154] [3/0] Profiler function <class 'torch.autograd.profiler.record_function'> will be ignored
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+/app/genesis_rl/training/collector.py:118: UserWarning: indexing with dtype torch.uint8 is now deprecated, please use a dtype torch.bool instead. (Triggered internally at /pytorch/aten/src/ATen/native/IndexingUtils.h:29.)
+  out[nz] = self._encode_all(rgb_u8[nz])
+[learner] collector3 up: stage=0 seed=0 envs=384 backend=batch
+[learner] collector6 up: stage=0 seed=0 envs=384 backend=batch
+[learner] collector5 up: stage=0 seed=0 envs=384 backend=batch
+[learner] t=20736 upd=66 gates=0.01 succ=0.01
+[learner] t=216653 upd=578 gates=0.00 succ=0.00
+[learner] t=405552 upd=1090 gates=0.01 succ=0.01
+[learner] t=591822 upd=1602 gates=0.01 succ=0.01
+[learner] t=749643 upd=2242 gates=0.02 succ=0.02
+[learner] t=883355 upd=2774 gates=0.10 succ=0.09
+[learner] t=1051052 upd=3301 gates=0.16 succ=0.16
+[learner] t=1183562 upd=3717 gates=0.21 succ=0.21
+[learner] t=1294574 upd=4065 gates=0.29 succ=0.29
+[learner] t=1403614 upd=4407 gates=0.39 succ=0.38
+[learner] t=1541059 upd=4839 gates=0.47 succ=0.45
+[learner] t=1677788 upd=5268 gates=0.45 succ=0.44
+[learner] t=1791805 upd=5626 gates=0.42 succ=0.40
+[learner] t=1904699 upd=5981 gates=0.43 succ=0.41
