@@ -160,7 +160,9 @@ def run_sync(cfg, resume: str | None = None, smoke: bool = False):
                 if stats:
                     print(f"[train] t={learner.transitions} upd={learner.updates} "
                           f"gates={stats.get('episode/gates_mean', 0):.2f} "
-                          f"succ={stats.get('episode/success_rate', 0):.2f} stage={stage}")
+                          f"succ={stats.get('episode/success_rate', 0):.2f} "
+                          f"succ_fs={stats.get('episode/success_rate_full_start', float('nan')):.2f} "
+                          f"stage={stage}")
                 last_stats = time.time()
 
             rebuild = collector.maybe_curriculum()
@@ -365,9 +367,12 @@ def learner_main(cfg, gpu_index: int, resume: str | None, q_trans, q_weights_lis
             stats = learner.logger.flush_episode_stats(learner.transitions)
             learner.maybe_checkpoint(stats)
             if stats:
+                # succ は途中スポーン込みの見かけ。succ_fs(正規スタート限定)が進級判定の値。
                 print(f"[learner] t={learner.transitions} upd={learner.updates} "
                       f"gates={stats.get('episode/gates_mean', 0):.2f} "
-                      f"succ={stats.get('episode/success_rate', 0):.2f}")
+                      f"succ={stats.get('episode/success_rate', 0):.2f} "
+                      f"succ_fs={stats.get('episode/success_rate_full_start', float('nan')):.2f} "
+                      f"resume={stats.get('curriculum/resume_prob', 0):.2f}")
             last_stats = now
 
     learner.maybe_checkpoint(force=True)

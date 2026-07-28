@@ -233,7 +233,9 @@ class Collector:
                              "resume_prob": float(self.env.resume_prob),
                              "stage": int(self.curriculum.stage),
                              "episode_sums": info.get("episode", {})})
-        self.curriculum.record_episodes([bool(s) for s in succ])
+        # 進級/アニール統計は正規スタート(spawn_gate<=1)のエピソードのみ。途中スポーンは
+        # 残りゲートが少なくfinishしやすいので混ぜると success_rate が甘くなる。
+        self.curriculum.record_episodes([bool(s) for s in succ], spawn_g)
         # 逆カリキュラム: 成功率の変化に追従して途中スポーン確率を更新
         self.env.set_stage_runtime(resume_prob=self.curriculum.resume_prob_now())
 

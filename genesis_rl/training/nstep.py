@@ -40,11 +40,14 @@ class NStepAssembler:
         age_new = (self.age + 1).clamp(max=n)
 
         # 2) pending全行に割引報酬を加算(行の経過k=0..n-1、γ^k·r)
+        # boolマスクのadvanced indexing(rew[mask] / rew_acc[slot,mask])は内部でnonzeroを呼び、
+        # 要素数をホストへ返すためGPU同期が入る。mask.any()も同期。1 push あたり n×2 回の
+        # 同期になり、num_envsが増えるほど支配的になっていた(実測 384→640envで
+        # nstep 37.6ms→117.3ms = env数1.67倍に対し3.1倍)。0/1を掛ける形に書き換えると
+        # 純粋な要素ごと演算になり同期が消える。マスク外は0加算なので出力は厳密に同一。
         for k in range(n):
             slot = (h - k) % n
-            mask = age_new > k
-            if mask.any():
-                self.rew_acc[slot, mask] += (self.gamma ** k) * rew[mask]
+            self.rew_acc[slot] += (self.gamma ** k) * rew * (age_new > k).to(rew.dtype)
 
         out = {key: [] for key in ("feat", "vec", "priv", "act", "rew", "gpow", "done",
                                    "nfeat", "nvec", "npriv")}

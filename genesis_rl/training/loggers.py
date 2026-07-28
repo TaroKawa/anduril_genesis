@@ -19,12 +19,19 @@ class TrainLogger:
         self.ep_return = deque(maxlen=2000)
         self.ep_spawn_gate = deque(maxlen=2000)
         self.ep_spawn_dist = deque(maxlen=2000)
+        # 正規スタート(spawn_gate<=1)だけの成功率/通過ゲート数。逆カリキュラム中の
+        # episode/success_rate は途中スポーン(残りゲートが少なくfinishしやすい)を含むので
+        # 実力より甘く出る。進級を決めるのは curriculum 側の正規スタート限定の値なので
+        # (curriculum.record_episodes)、同じ母集団の系列をここでも出して可視化する。
+        self.ep_fs_success = deque(maxlen=2000)
+        self.ep_fs_gates = deque(maxlen=2000)
         # 失敗モードの内訳(なぜ/どこでエピソードが終わるか)。done=collision|finish|timeout。
         self.ep_collision = deque(maxlen=2000)
         self.ep_finish = deque(maxlen=2000)
         self._resume_prob = None
         self._stage = None
-        self._history = {"transitions": [], "gates": [], "success": [], "return": []}
+        self._history = {"transitions": [], "gates": [], "success": [], "success_fs": [],
+                         "return": []}
 
     def log_episode(self, transitions: int, info: dict):
         self.ep_gates.append(info["gates"])
@@ -32,6 +39,9 @@ class TrainLogger:
         self.ep_return.append(info.get("episode_sums", {}).get("total", 0.0))
         if "spawn_gate" in info:
             self.ep_spawn_gate.append(info["spawn_gate"])
+            if int(info["spawn_gate"]) <= 1:
+                self.ep_fs_success.append(1.0 if info["success"] else 0.0)
+                self.ep_fs_gates.append(info["gates"])
         if "spawn_dist_g1" in info:
             self.ep_spawn_dist.append(info["spawn_dist_g1"])
         if "collision" in info:
@@ -61,6 +71,12 @@ class TrainLogger:
             stats["curriculum/spawn_dist_gate1_mean"] = sum(self.ep_spawn_dist) / len(self.ep_spawn_dist)
         if self._resume_prob is not None:
             stats["curriculum/resume_prob"] = self._resume_prob
+        # 正規スタート限定(=進級判定と同じ母集団)。episode/success_rate と併記することで
+        # 「途中スポーン込みの見かけ」と「フルコースの実力」を分けて追える。
+        if self.ep_fs_success:
+            stats["episode/success_rate_full_start"] = sum(self.ep_fs_success) / len(self.ep_fs_success)
+            stats["episode/gates_mean_full_start"] = sum(self.ep_fs_gates) / len(self.ep_fs_gates)
+            stats["curriculum/full_start_frac"] = len(self.ep_fs_success) / len(self.ep_success)
         if self._stage is not None:
             stats["curriculum/stage"] = self._stage
         # 失敗モードの内訳: なぜエピソードが終わったか(衝突/完走/タイムアウト)。
@@ -86,6 +102,7 @@ class TrainLogger:
         h["transitions"].append(transitions)
         h["gates"].append(stats["episode/gates_mean"])
         h["success"].append(stats["episode/success_rate"])
+        h["success_fs"].append(stats.get("episode/success_rate_full_start", float("nan")))
         h["return"].append(stats["episode/return_mean"])
         return stats
 
@@ -100,7 +117,10 @@ class TrainLogger:
                 return
             fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
             axes[0].plot(h["transitions"], h["gates"]); axes[0].set_ylabel("gates/ep")
-            axes[1].plot(h["transitions"], h["success"]); axes[1].set_ylabel("success rate")
+            # ラベルはASCII固定(コンテナにCJKフォントが無く豆腐になるため)
+            axes[1].plot(h["transitions"], h["success"], label="all (incl. resume spawn)")
+            axes[1].plot(h["transitions"], h["success_fs"], label="full start (advance metric)")
+            axes[1].set_ylabel("success rate"); axes[1].legend(fontsize=8)
             axes[2].plot(h["transitions"], h["return"]); axes[2].set_ylabel("return")
             axes[2].set_xlabel("transitions")
             fig.tight_layout()
