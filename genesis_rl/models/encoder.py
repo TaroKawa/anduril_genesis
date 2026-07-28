@@ -37,16 +37,22 @@ class FrozenDINOv2(nn.Module):
         ネットワークを一切使わずロードする(torch-cacheボリュームに永続化される)。
 
         複数collectorが同時に初回ロードするとzip展開が競合する(展開途中に他プロセスの
-        renameで展開先が消えFileNotFoundError)ため、flockで直列化する。"""
-        import fcntl
+        renameで展開先が消えFileNotFoundError)ため、flockで直列化する。
+        Windows(本番シム推論)にはfcntlが無いが、推論は単一プロセスなので排他不要。"""
         import os
+
+        try:
+            import fcntl
+        except ModuleNotFoundError:
+            fcntl = None
 
         repo, model = "facebookresearch/dinov2", "dinov2_vits14"
         hub_dir = torch.hub.get_dir()
         local = os.path.join(hub_dir, "facebookresearch_dinov2_main")
         os.makedirs(hub_dir, exist_ok=True)
         with open(os.path.join(hub_dir, ".dinov2.lock"), "w") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)   # withを抜ける(close)と自動解放
+            if fcntl is not None:
+                fcntl.flock(lf, fcntl.LOCK_EX)   # withを抜ける(close)と自動解放
             if os.path.isdir(local):
                 try:
                     return torch.hub.load(local, model, source="local")
